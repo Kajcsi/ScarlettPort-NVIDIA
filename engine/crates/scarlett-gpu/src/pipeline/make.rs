@@ -507,6 +507,10 @@ fn next(screens_only: bool) -> Arc<Pending> {
     }
 }
 
+/// Stack of each pipeline worker: room for the driver's shader compiler,
+/// which runs on it (reserved address space; committed only as used).
+const PIPELINE_STACK: usize = 64 << 20;
+
 /// How many workers make pipelines: `asked` (`SCARLETT_PIPELINE_WORKERS`, 1 to
 /// 64), else two thirds of the logical processors, 2 to 16. They run below the
 /// title's own threads, and a cold cache queues hundreds at once.
@@ -534,6 +538,10 @@ fn workers() -> bool {
             std::thread::available_parallelism().map_or(2, |n| n.get()),
             crate::residency::limited_host_ram(),
         );
+                // The driver compiles pipelines on this thread, recursively:
+                // NVIDIA's compiler (nvgpucomp64) overflowed the default 2 MB
+                // on a world compute program and refused it as out of memory.
+                .stack_size(PIPELINE_STACK)
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
