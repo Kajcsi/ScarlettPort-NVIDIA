@@ -75,6 +75,8 @@ fn build() -> [u8; 32] {
             "SCARLETT_MESH_OUTPUT_STRICT",
             "SCARLETT_BVH_FENCES",
             "SCARLETT_BVH_BOUNDS",
+            // Whether the ray-tracing node test always misses.
+            "SCARLETT_RT_MISS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
