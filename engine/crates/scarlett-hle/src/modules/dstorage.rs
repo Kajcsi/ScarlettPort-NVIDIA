@@ -1613,6 +1613,44 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     result
 }
 
+/// Makes the committed pages of `[at, at + len)` that cannot be written
+/// read-write; returns each such region with its old protection.
+fn open_read_only(at: usize, len: usize) -> Vec<(usize, usize, u32)> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
+        PAGE_READWRITE, PAGE_WRITECOPY, VirtualProtect, VirtualQuery,
+    };
+    let (mut p, end, mut opened) = (at, at + len, Vec::new());
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) } == 0 {
+            break;
+        }
+        let region_end = (info.BaseAddress as usize + info.RegionSize).min(end);
+        let writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if info.State == MEM_COMMIT && (info.Protect & writable == 0 || info.Protect & PAGE_GUARD != 0) {
+            let mut old = 0;
+            // SAFETY: committed title memory the request names; only its protection changes.
+            if unsafe { VirtualProtect(p as *const _, region_end - p, PAGE_READWRITE, &mut old) } != 0 {
+                opened.push((p, region_end - p, old));
+            }
+        }
+        p = region_end;
+    }
+    opened
+}
+
+/// Gives the regions [`open_read_only`] opened their protection back.
+fn close_again(regions: &[(usize, usize, u32)]) {
+    for &(at, len, old) in regions {
+        let mut was = 0;
+        // SAFETY: regions we opened just before.
+        unsafe { windows_sys::Win32::System::Memory::VirtualProtect(at as *const _, len, old, &mut was) };
+    }
+}
+
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
@@ -1631,7 +1669,12 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
+        // The console's engine writes past the processor's page protection;
+        // pages the title made read-only (no guard of ours) are opened for
+        // the write and closed again (a fault here, run of 25/11).
+        let closed = open_read_only(request.destination as usize, len);
         let filled = fill(out).map(drop);
+        close_again(&closed);
         drop(writing);
         // Again now that the bytes are there: a texture looked at in between
         // was uploaded without them (`xmem::pages_written`).
@@ -1964,6 +2007,40 @@ mod tests {
         assert_eq!(raw, plain[5000..6000]);
         assert_eq!(inflated, plain);
         void(queue, 0x40);
+    }
+
+    fn writable_now(at: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery};
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        info.Protect == PAGE_READWRITE
+    }
+
+    /// Read-only memory no guard of ours holds is written all the same,
+    /// like the console's engine does, and stays read-only afterwards.
+    #[test]
+    fn reads_into_read_only_memory_land_and_keep_its_protection() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, VirtualAlloc, VirtualFree,
+        };
+        let plain = pattern(6576);
+        let (_dir, file) = file_with(&plain);
+        // SAFETY: a fresh read-only allocation, freed at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY) };
+        assert!(!at.is_null());
+        let (queue, array) = (new_queue(0), status_array(1));
+        enqueue(queue, &request(0, at, plain.len(), file, 0, plain.len()));
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        // SAFETY: our readable allocation.
+        assert_eq!(unsafe { std::slice::from_raw_parts(at.cast::<u8>(), plain.len()) }, &plain[..]);
+        assert!(!writable_now(at as usize), "the title's protection is given back");
+        void(queue, 0x40);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(at, 0, MEM_RELEASE) };
     }
 
     #[test]
