@@ -46,6 +46,9 @@ pub(crate) struct Pending {
     screen: bool,
     /// Confirmed first-scene / bake producer prepared early even on a cold cache.
     scene_input: bool,
+    /// One-time data initialization: made before its first dispatch, past
+    /// the frame's wait budget ([`required_initialization`]).
+    required_initialization: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
     /// Left out while ray tracing is off (`ray_tracing`, live).
@@ -56,6 +59,14 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
     shaders
         .iter()
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+}
+
+/// This producer writes the head mappings kept for the run. Its first
+/// dispatch dropped (still compiling, wait budget 0) leaves later head
+/// skinning reading uninitialized data even after the compiler queue drains.
+/// Ported from VIscosity 700fc784 (Xyzstk).
+fn required_initialization(shaders: &[Arc<Shader>]) -> bool {
+    named(shaders, b"CS_ComputeBlendshapeMappings")
 }
 
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
@@ -121,7 +132,8 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
-        let scene_input = scene_input(&shaders);
+        let required_initialization = required_initialization(&shaders);
+        let scene_input = required_initialization || scene_input(&shaders);
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
@@ -130,6 +142,7 @@ impl Pending {
         Pending {
             screen,
             scene_input,
+            required_initialization,
             left_out,
             ray_pass,
             shaders,
@@ -265,7 +278,13 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if p.required_initialization {
+            // The OnceLock waits for a worker already making it, or makes it
+            // here: the shared frame budget must not discard a one-time write.
+            p.make();
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
 }
