@@ -9192,6 +9192,13 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
             });
         });
     }
+                if crate::descriptor::host::show_new_later() {
+                    tracing::info!(
+                        "slots of textures made while lists sent before them ran, shown once those had run \
+                         (SCARLETT_SHOW_NEW_LATER=1), since the start: {}",
+                        crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
+                    );
+                }
     got
 }
 
