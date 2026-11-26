@@ -15,6 +15,7 @@ mod host;
 mod image_watch;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use scarlett_gpu::frame_phase;
+pub use scarlett_gpu::frames_begun;
 
 pub mod modules;
 mod registry;
