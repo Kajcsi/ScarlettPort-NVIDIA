@@ -53,7 +53,7 @@ const RESCAN: Duration = Duration::from_secs(2);
 static LATEST: Mutex<Option<(PadState, Instant)>> = Mutex::new(None);
 
 /// Whether PlayStation pads are read (`SCARLETT_PAD_PS=0`: not).
-fn on() -> bool {
+pub(super) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("SCARLETT_PAD_PS").is_none_or(|v| v != "0"))
 }
