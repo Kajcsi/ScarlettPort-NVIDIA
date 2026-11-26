@@ -105,6 +105,15 @@ fn build() -> [u8; 32] {
         bytes.push(scarlett_shader::emit::wave64_lds() as u8);
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&scarlett_shader::emit::shader_opt().to_le_bytes());
+        // Only when on (after deynesdev fab7fda): the loose-LDS forms of wave64
+        // programs on 32-lane hosts (`SCARLETT_WAVE_LDS_LOOSE=1`), and `ds_bpermute` within
+        // 32-lane halves with the 32 KiB group-shared limit kept to (`SCARLETT_WAVE32_FIXES=1`).
+        if scarlett_shader::emit::wave_lds_loose() {
+            bytes.extend_from_slice(b"SCARLETT_WAVE_LDS_LOOSE=1");
+        }
+        if scarlett_shader::emit::wave32_fixes() {
+            bytes.extend_from_slice(b"SCARLETT_WAVE32_FIXES=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
