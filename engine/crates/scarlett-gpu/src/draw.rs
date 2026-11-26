@@ -3535,6 +3535,10 @@ impl State {
         if crate::skinlog::on() {
             self.skin_note(list, p, [x, y, z]);
         }
+        // A dispatch counted in threads runs the groups worked out from them
+        // (the structure builder's: never spread, its programs are spilled);
+        // any other the counts `spread_groups` gave.
+        let (gx, gy, gz) = if size.is_some() { (x, y, z) } else { (gx, gy, gz) };
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(gx, gy, gz) };
         self.buffers_written();
