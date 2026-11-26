@@ -3626,6 +3626,7 @@ unsafe fn wait_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, conte
     }
     let status = unsafe { WaitForSingleObject(event, INFINITE) };
     if status != windows::Win32::Foundation::WAIT_OBJECT_0 {
+    crate::port::log(frames);
         fail(format_args!("{context}: fence wait failed: {status:?}"));
     }
     let completed = unsafe { fence.GetCompletedValue() };
@@ -7932,6 +7933,7 @@ impl HostList {
                     }
                     batch.fill();
                     batch.title_written();
+                    crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7947,6 +7949,7 @@ impl HostList {
                     {
                         copies += 1;
                     }
+                    crate::port::filled(src, len);
                     if wide_fills() {
                         batch.fills.push((dst, src, len));
                         bytes += len as u64;
