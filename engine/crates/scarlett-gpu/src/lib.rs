@@ -106,6 +106,9 @@ pub mod timeline;
 pub mod titlewrite;
 #[cfg(windows)]
 mod upload;
+/// Address space for lists' uploads, taken before the title runs.
+#[cfg(windows)]
+pub use upload::reserve_window as reserve_upload_window;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]

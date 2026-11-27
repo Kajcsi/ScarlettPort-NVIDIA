@@ -76,6 +76,12 @@ pub fn run(
         None => println!("build          unknown ({hash})"),
     }
 
+    // Before anything of the title is mapped or runs: its memory is placed
+    // from 4 GiB up as ours must be (scar11 found no room later).
+    #[cfg(windows)]
+    if execute {
+        scarlett_hle::reserve_upload_window();
+    }
     let images = cfg.cache_subdir("images")?;
     scarlett_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = scarlett_loader::load(&prepared, &images)?;

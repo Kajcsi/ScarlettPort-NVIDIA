@@ -34,6 +34,9 @@ pub use scarlett_gpu::replay;
 
 #[cfg(windows)]
 pub use scarlett_gpu::pipeline::known as known_pipelines;
+/// Address space for lists' uploads, taken before the title runs.
+#[cfg(windows)]
+pub use scarlett_gpu::reserve_upload_window;
 
 use scarlett_loader::{ImportResolver, Provenance, Resolution};
 use scarlett_pe::ImportSymbol;

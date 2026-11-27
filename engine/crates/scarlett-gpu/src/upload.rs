@@ -54,10 +54,124 @@ fn gap(taken: &[bool], n: usize) -> Option<usize> {
     None
 }
 
+/// Address space every [`reserve`] is cut from first, taken before the
+/// title runs ([`reserve_window`]). The title's own memory is placed from
+/// 4 GiB up too, and what was reserved only when first needed could find
+/// no place left: at 2560x1440 on the Series S profile a list's upload
+/// memory asked for at the first frame in the world was refused and the
+/// title's BVH builder threw "Failed to allocate upload buffer" (scar11).
+/// Everything cut from it lives as long as the process, as before.
+const WINDOW: usize = 2 << 30;
+/// Committed with the window, so the first uploads never wait on commit.
+const WINDOW_COMMITTED: usize = 64 << 20;
+
+/// The window's start (0: none) and the bytes cut from it.
+static WINDOW_AT: Mutex<(usize, usize)> = Mutex::new((0, 0));
+
+/// Reserves the [`WINDOW`]; called once before the title runs. Without it
+/// (or when it is used up) each [`reserve`] takes a place of its own.
+pub fn reserve_window() {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+    if !low() {
+        return;
+    }
+    let mut window = WINDOW_AT.lock().unwrap_or_else(|e| e.into_inner());
+    if window.0 != 0 {
+        return;
+    }
+    let Some(at) = place(WINDOW, false) else {
+        explain_refusal(WINDOW, "address space for lists' uploads not reserved at start");
+        return;
+    };
+    // SAFETY: the start of the reservation just made.
+    let committed = !unsafe { VirtualAlloc(at as *const _, WINDOW_COMMITTED, MEM_COMMIT, PAGE_READWRITE) }.is_null();
+    *window = (at, 0);
+    tracing::info!(
+        at = format_args!("{at:#x}"),
+        bytes = WINDOW,
+        committed = if committed { WINDOW_COMMITTED } else { 0 },
+        "address space for lists' uploads and the directory of memory by address, reserved at start"
+    );
+}
+
+/// Says once in a while why a reservation was refused: Windows' error (1455:
+/// the commit limit; 8: no place), the free commit, and the free address
+/// space where these must lie. Call it right after the refused call.
+fn explain_refusal(len: usize, what: &str) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: no arguments.
+    let error = unsafe { GetLastError() };
+    static SAID: AtomicU32 = AtomicU32::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) >= 8 {
+        return;
+    }
+    let (mut free, mut largest) = (0usize, 0usize);
+    let mut at = 1usize << 32;
+    while at < 1 << 37 {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+            break;
+        }
+        let end = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(1 << 37);
+        if end <= at {
+            break;
+        }
+        if info.State == MEM_FREE {
+            free += end - at;
+            largest = largest.max(end - at);
+        }
+        at = end;
+    }
+    // SAFETY: the API fills in a correctly sized structure.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: as above.
+    let commit = if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 { status.ullAvailPageFile >> 20 } else { 0 };
+    tracing::warn!(
+        bytes = len,
+        error,
+        available_commit_mib = commit,
+        free_below_2_37_mib = free >> 20,
+        largest_free_below_2_37_mib = largest >> 20,
+        "{what}"
+    );
+}
+
 /// Fresh zeroed memory in [4 GiB, 2^37) (where the directory of memory by
 /// address reaches, `MEMORY_PAGES`), write-watched as the title's own
-/// pools are (copies then take only written pages).
+/// pools are (copies then take only written pages): cut from the
+/// [`WINDOW`] while it has room, else a reservation of its own.
 pub(crate) fn reserve(len: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+    let cut = len.max(1).next_multiple_of(BLOCK);
+    {
+        let mut window = WINDOW_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let (start, used) = *window;
+        if start != 0 && used + cut <= WINDOW {
+            let at = start + used;
+            // SAFETY: inside the window's reservation, never handed out
+            // before (so still zeroed).
+            if !unsafe { VirtualAlloc(at as *const _, cut, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+                window.1 += cut;
+                return Some(at);
+            }
+            explain_refusal(cut, "memory for lists' uploads refused (commit in the window reserved at start)");
+        }
+    }
+    let at = place(len, true);
+    if at.is_none() {
+        explain_refusal(len, "memory for lists' uploads refused");
+    }
+    at
+}
+
+/// A fresh reservation in [4 GiB, 2^37), write-watched, committed or not.
+fn place(len: usize, commit: bool) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{
         MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE, MemExtendedParameterAddressRequirements,
         PAGE_READWRITE, VirtualAlloc2,
@@ -78,7 +192,7 @@ pub(crate) fn reserve(len: usize) -> Option<usize> {
             std::ptr::null_mut(),
             std::ptr::null(),
             len,
-            MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+            MEM_RESERVE | MEM_WRITE_WATCH | if commit { MEM_COMMIT } else { 0 },
             PAGE_READWRITE,
             &mut parameter,
             1,
@@ -167,6 +281,21 @@ mod tests {
         // SAFETY: the bytes were handed out.
         unsafe { d.start().add(ARENA).write(1) };
         drop(b);
+    }
+
+    #[test]
+    fn reservations_are_cut_from_the_window_once_it_is_there() {
+        reserve_window();
+        let (start, _) = *WINDOW_AT.lock().unwrap();
+        assert!(start >= 1 << 32 && start + WINDOW <= 1 << 37);
+        let a = reserve(100).unwrap();
+        let b = reserve(BLOCK + 1).unwrap();
+        assert!((start..start + WINDOW).contains(&a) && (start..start + WINDOW).contains(&b));
+        assert!(a.is_multiple_of(BLOCK) && b.is_multiple_of(BLOCK) && a != b);
+        // SAFETY: committed and zeroed, ours alone.
+        assert!(unsafe { std::slice::from_raw_parts(b as *const u8, BLOCK + 1) }.iter().all(|&x| x == 0));
+        // SAFETY: as above.
+        unsafe { (b as *mut u8).add(BLOCK).write(1) };
     }
 
     #[test]
