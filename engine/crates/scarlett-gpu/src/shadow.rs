@@ -302,7 +302,7 @@ impl CopiedState {
     }
 }
 
-mod elide;
+pub(crate) mod elide;
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {

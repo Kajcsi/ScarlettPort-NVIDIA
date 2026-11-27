@@ -5370,6 +5370,8 @@ impl Host {
         for (shadow, lo, hi, _) in &pieces {
             traffic::moved(traffic::FETCHED, shadow.span(), std::iter::once((*lo, *hi)));
         }
+        // Shaders wrote these: the copies that only shaders write are found by it.
+        crate::shadow::elide::fetched(pieces.iter().map(|(shadow, lo, hi, _)| (shadow, *lo, *hi)));
         // The sends these flights ran behind, all a fetch on the copy queue
         // is known to have run behind.
         let behind = plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0);
@@ -5724,6 +5726,7 @@ impl Host {
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
         }
         let mut written = vec![0usize; plan.ranges.len()];
+        crate::shadow::elide::fetched(pieces.iter().map(|&(i, lo, hi, _)| (&plan.ranges[i].shadow, lo, hi)));
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
@@ -8247,6 +8250,8 @@ impl HostList {
                     batch.fill();
                     batch.title_written();
                     crate::port::copied(dst, src, len);
+                    // (After maren-halv/VIctory-DXR dd83629.) A step reads title memory: a copy there that is left out of the copy-back is not any more.
+                    crate::shadow::elide::cpu_read(src, len);
                     // Renderer port #7: into a heap's records, the rounds
                     // asked earlier did not see it.
                     if crate::descriptor::in_shader_heap(dst, len) {
@@ -8268,6 +8273,7 @@ impl HostList {
                     {
                         copies += 1;
                     }
+                    crate::shadow::elide::cpu_read(src, len);
                     crate::port::filled(src, len);
                     // What copies at their place wrote there without title
                     // memory taking it ([`place::Known`]).
@@ -8287,6 +8293,7 @@ impl HostList {
                 }
                 Step::Placed(p) => {
                     let started = std::time::Instant::now();
+                    crate::shadow::elide::cpu_read(p.src, p.len);
                     if crate::descriptor::in_shader_heap(p.dst, p.len) {
                         crate::port_journal::prep_wrote();
                     }
@@ -8357,6 +8364,8 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    crate::shadow::elide::cpu_read(at, len);
                     if batch.texture_due(staging) {
                         batch.due.push(staging.clone());
                         if !wide_textures() {
@@ -8374,7 +8383,8 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::Plane((_, len), fill) => {
+                Step::Plane((at, len), fill) => {
+                    crate::shadow::elide::cpu_read(*at, *len);
                     let started = std::time::Instant::now();
                     fill();
                     PREPARING[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -10266,6 +10276,7 @@ impl Meter {
                     put[2] / 1e6,
                     put[3]
                 );
+                crate::shadow::elide::log(frames);
                 traffic::line(self.copy_stats_frames as f64);
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
