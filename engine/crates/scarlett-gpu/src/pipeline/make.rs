@@ -227,8 +227,17 @@ impl Pending {
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    // Left out ones are never made: not "being made" (scar13 counted some 900
+    // draws a frame so, with nothing queued).
+    if let Some(why) = p.left_out {
+        return Some(why.into());
+    }
+    if let Some(why) = p.ray_pass.filter(|_| super::ray_tracing::off_now()) {
+        return Some(format!("{why} (ray tracing off)"));
+    }
     match p.made.get() {
         Some(Some(_)) => None,
+        None if p.queue_state.load(Ordering::Relaxed) == NOT_QUEUED => Some("never queued".into()),
         None => Some("being made".into()),
         Some(None) => {
             let failed: Vec<String> = p

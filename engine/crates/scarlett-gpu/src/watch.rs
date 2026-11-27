@@ -254,7 +254,7 @@ pub(crate) fn lock_waits(frames: f64) -> String {
         let [n, ns] = [0, 1].map(|i| WAITS[what][i].swap(0, std::sync::atomic::Ordering::Relaxed));
         format!("{:.0} {:.2} ms", n as f64 / frames, ns as f64 / 1e6 / frames)
     };
-    format!("ranges held {}, journal read {}, journal noted in {}, guards {}", of(0), of(1), of(2), of(3))
+    format!("ranges held {}, journal read {}, journal noted in {}, guards {}{}", of(0), of(1), of(2), of(3), hold_line(frames))
 }
 
 /// The page ranges some thread is asking about: asking forgets what it
@@ -1641,7 +1641,8 @@ pub(crate) fn asks() -> [u64; 13] {
 }
 
 /// The guards' lock, the wait for it counted.
-fn guards_timed() -> std::sync::RwLockWriteGuard<'static, Guards> {
+#[track_caller]
+fn guards_timed() -> GuardsHeld {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let g = guards();
@@ -1932,11 +1933,121 @@ static GUARDS: RwLock<Guards> = RwLock::new(Guards {
 });
 
 /// The guards, alone.
-fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
-    if let Ok(g) = GUARDS.try_write() {
-        return g;
+#[track_caller]
+fn guards() -> GuardsHeld {
+    let g = match GUARDS.try_write() {
+        Ok(g) => g,
+        Err(_) => waited(3, || GUARDS.write().unwrap_or_else(|e| e.into_inner())),
+    };
+    GuardsHeld::new(g)
+}
+
+/// The guards' lock held alone; with diagnostics, how long, by the place in
+/// the code that took it ([`hold_line`]): scar13 waited 69 ms a frame for it,
+/// all threads together, without knowing for whom.
+struct GuardsHeld {
+    g: std::mem::ManuallyDrop<std::sync::RwLockWriteGuard<'static, Guards>>,
+    #[cfg(feature = "diagnostics")]
+    at: &'static std::panic::Location<'static>,
+    #[cfg(feature = "diagnostics")]
+    since: std::time::Instant,
+}
+
+impl GuardsHeld {
+    #[track_caller]
+    fn new(g: std::sync::RwLockWriteGuard<'static, Guards>) -> Self {
+        GuardsHeld {
+            g: std::mem::ManuallyDrop::new(g),
+            #[cfg(feature = "diagnostics")]
+            at: std::panic::Location::caller(),
+            #[cfg(feature = "diagnostics")]
+            since: std::time::Instant::now(),
+        }
     }
-    waited(3, || GUARDS.write().unwrap_or_else(|e| e.into_inner()))
+}
+
+impl std::ops::Deref for GuardsHeld {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        &self.g
+    }
+}
+
+impl std::ops::DerefMut for GuardsHeld {
+    fn deref_mut(&mut self) -> &mut Guards {
+        &mut self.g
+    }
+}
+
+impl Drop for GuardsHeld {
+    fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        let held = self.since.elapsed().as_nanos() as u64;
+        // SAFETY: dropped once, here; the lock is let go before the count.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.g) };
+        #[cfg(feature = "diagnostics")]
+        held_for(self.at, held);
+    }
+}
+
+/// Since the last line: by place (file and line), how often the guards were
+/// held alone and for how many nanoseconds. A fixed table, no lock.
+#[cfg(feature = "diagnostics")]
+static HELD: [[std::sync::atomic::AtomicU64; 3]; 128] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 128];
+
+#[cfg(feature = "diagnostics")]
+fn held_for(at: &'static std::panic::Location<'static>, ns: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // The place as a key: the line, and the file's name hashed above it.
+    let file = at.file().bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)));
+    let key = (file << 32 | u64::from(at.line())) | 1;
+    let start = (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 57) as usize;
+    for i in 0..HELD.len() {
+        let slot = &HELD[(start + i) % HELD.len()];
+        let mut k = slot[0].load(Relaxed);
+        if k == 0 {
+            match slot[0].compare_exchange(0, key, Relaxed, Relaxed) {
+                Ok(_) => {
+                    // (Once per place: the table's own lock is taken only here.)
+                    PLACES.lock().unwrap_or_else(|e| e.into_inner()).insert(key, at);
+                    k = key;
+                }
+                Err(now) => k = now,
+            }
+        }
+        if k == key {
+            slot[1].fetch_add(1, Relaxed);
+            slot[2].fetch_add(ns, Relaxed);
+            return;
+        }
+    }
+}
+
+/// The places [`HELD`] counts, by key.
+#[cfg(feature = "diagnostics")]
+static PLACES: Mutex<BTreeMap<u64, &'static std::panic::Location<'static>>> = Mutex::new(BTreeMap::new());
+
+/// [`HELD`], taken, for the log: the places that held the guards longest.
+#[cfg(feature = "diagnostics")]
+fn hold_line(frames: f64) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let places = PLACES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut all: Vec<(u64, u64, u64)> = HELD
+        .iter()
+        .filter(|s| s[1].load(Relaxed) != 0)
+        .map(|s| (s[0].load(Relaxed), s[1].swap(0, Relaxed), s[2].swap(0, Relaxed)))
+        .collect();
+    all.sort_unstable_by_key(|a| std::cmp::Reverse(a.2));
+    let sum: u64 = all.iter().map(|a| a.2).sum();
+    let most: Vec<String> = all
+        .iter()
+        .take(6)
+        .map(|&(key, n, ns)| {
+            let at = places.get(&key).map_or_else(|| "?".into(), |l| format!("{}:{}", l.file().rsplit(['/', '\\']).next().unwrap_or(""), l.line()));
+            format!("{at} {:.0}x {:.2} ms", n as f64 / frames, ns as f64 / 1e6 / frames)
+        })
+        .collect();
+    format!("; held alone {:.2} ms a frame, longest by place: {}", sum as f64 / 1e6 / frames, most.join(", "))
 }
 
 /// The guards, shared (renderer port #6): what changes a block's state holds
@@ -3217,7 +3328,8 @@ fn forget_views(first: usize, last: usize) {
 
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
-fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'static, Guards> {
+#[track_caller]
+fn title_memory_changed(at: usize, len: usize) -> GuardsHeld {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
