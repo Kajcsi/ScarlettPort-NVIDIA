@@ -556,6 +556,10 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, host heap id, first,
     /// count; given back when the list has run, is reset or released.
     dynamic: Vec<(usize, u64, u32, u32)>,
+    /// Dynamic slots reserved for this list in one taking of the heap's lock
+    /// and handed to its tables from here: (title heap, host heap id, first,
+    /// count, used) (`SCARLETT_DYNAMIC_SLAB`).
+    slab: Option<(usize, u64, u32, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -570,8 +574,20 @@ pub(crate) struct State {
     recording: u64,
 }
 
+/// Whether a list reserves its tables' dynamic slots in slabs of
+/// [`DYNAMIC_SLAB`] (`SCARLETT_DYNAMIC_SLAB`, on; `0`: the heap's lock taken
+/// for every table). After ToLIManl/VIctory-Hydra (GPL-3.0-or-later).
+fn dynamic_slab_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SCARLETT_DYNAMIC_SLAB").is_none_or(|v| v != "0"))
+}
+
+/// Dynamic slots a list reserves at a time.
+const DYNAMIC_SLAB: u32 = 256;
+
 impl Drop for State {
     fn drop(&mut self) {
+        self.flush_slab();
         for &(heap, id, first, n) in &self.dynamic {
             crate::descriptor::release_dynamic(heap, id, first, n);
         }
@@ -579,6 +595,49 @@ impl Drop for State {
 }
 
 impl State {
+    /// The slab's used slots become the list's; the rest go back to the heap.
+    fn flush_slab(&mut self) {
+        if let Some((heap, id, first, len, used)) = self.slab.take() {
+            if used > 0 {
+                self.dynamic.push((heap, id, first, used));
+            }
+            if used < len {
+                crate::descriptor::release_dynamic(heap, id, first + used, len - used);
+            }
+        }
+    }
+
+    /// `n` consecutive dynamic slots of `host` (the host heap of the title
+    /// heap `heap`) for this list, from its slab when there is room there;
+    /// the first's index. Taken until the list's tables are done.
+    fn alloc_dynamic(&mut self, heap: usize, host: &crate::descriptor::host::HostHeap, n: u32) -> Option<u32> {
+        let id = host.id();
+        if dynamic_slab_on() && n > 0 {
+            if let Some((h, i, first, len, used)) = &mut self.slab
+                && *h == heap
+                && *i == id
+                && used.checked_add(n).is_some_and(|end| end <= *len)
+            {
+                let at = *first + *used;
+                *used += n;
+                return Some(at);
+            }
+            self.flush_slab();
+            let (first, got) = host.dynamic_slab(n, DYNAMIC_SLAB).or_else(|| {
+                crate::host::settle_for_fence();
+                host.dynamic_slab(n, DYNAMIC_SLAB)
+            })?;
+            self.slab = Some((heap, id, first, got, n));
+            return Some(first);
+        }
+        let first = host.dynamic(n).or_else(|| {
+            crate::host::settle_for_fence();
+            host.dynamic(n)
+        })?;
+        self.dynamic.push((heap, id, first, n));
+        Some(first)
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -587,6 +646,7 @@ impl State {
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
+        self.flush_slab();
         if self.tables_gone && self.dynamic.is_empty() {
             return;
         }
@@ -2165,12 +2225,14 @@ impl State {
             }
             Some(s)
         };
+        #[cfg(feature = "diagnostics")]
+        let pipeline = self.pipeline;
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
                 #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(a, len, self.pipeline);
+                crate::host::wide_write(a, len, pipeline);
                 s.gpu_writes(list, a, len);
             }
         };
@@ -2207,13 +2269,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
+                let Some(index) = self.alloc_dynamic(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, host.id(), index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -2281,13 +2339,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
+                let Some(index) = self.alloc_dynamic(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, host.id(), index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -4568,18 +4622,13 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n).or_else(|| {
-                crate::host::settle_for_fence();
-                host.dynamic(n)
-            }) else {
+            let Some(first) = self.alloc_dynamic(std::ptr::from_ref(heap) as usize, host, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
                 continue;
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + own_count <= host.count());
