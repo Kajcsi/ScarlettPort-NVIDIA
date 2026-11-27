@@ -4897,7 +4897,7 @@ fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out
 
 #[cfg(test)]
 mod changed_records_tests {
-    use super::changed_records;
+    use super::{changed_records, compact};
 
     /// A full list of changed ranges is made smaller, never emptied: every
     /// change is still covered.

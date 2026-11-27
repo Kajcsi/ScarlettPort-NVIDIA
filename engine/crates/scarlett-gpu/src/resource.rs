@@ -3788,6 +3788,19 @@ mod tests {
             assert_eq!(
                 layouts.map(|l| (l.offset, l.format, l.width, l.height)),
                 expected,
+                "format {format}"
+            );
+            assert!(
+                layouts.iter().all(|l| l.depth == 1 && l.row_pitch == 512),
+                "format {format}"
+            );
+            assert_eq!(rows, [8, 4, 8, 4, 8, 4, 8, 4], "format {format}");
+            assert_eq!(sizes, [64, 32, 64, 32, 16, 8, 16, 8], "format {format}");
+            assert_eq!(total, 24_072, "format {format}");
+            assert!(subresource(&desc, 8).is_none(), "format {format}");
+        }
+    }
+
     /// An earlier title-memory upload must not suppress a later alias copy
     /// from a GPU-written probe atlas into the same sampled texture.
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -3878,19 +3891,6 @@ mod tests {
         resource_release(view);
         resource_release(source);
         assert_eq!(actual, packed_light, "the sampled texture kept the CPU upload instead of the GPU atlas");
-    }
-
-                "format {format}"
-            );
-            assert!(
-                layouts.iter().all(|l| l.depth == 1 && l.row_pitch == 512),
-                "format {format}"
-            );
-            assert_eq!(rows, [8, 4, 8, 4, 8, 4, 8, 4], "format {format}");
-            assert_eq!(sizes, [64, 32, 64, 32, 16, 8, 16, 8], "format {format}");
-            assert_eq!(total, 24_072, "format {format}");
-            assert!(subresource(&desc, 8).is_none(), "format {format}");
-        }
     }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
