@@ -235,6 +235,53 @@ pub fn pool_size_code(size: u32) -> Vec<u8> {
     c
 }
 
+/// The title's heap sizes, a row per console (+0x6186250, 0x50 bytes each:
+/// the total, then nine heaps; +0x1e1ced0 copies the row its console check
+/// picks, and +0x1e1cf60 makes the heaps). Heap 2 holds graphics resources
+/// (protection 0x283, the allocator at +0x71c2808): 1277 MB on Series S,
+/// sized for its 1920x1080 output; 2199 MB on Series X, sized for
+/// 3840x2160. At 2560x1440 on Series S it ran out (int3 at +0x2219650 after
+/// a 2 MB allocation, scar9). This is the Series S row's heap 2.
+pub const GRAPHICS_HEAP: Site = Site {
+    at: 0x6186268,
+    what: "Series S graphics heap's size",
+    bytes: &[0x00, 0x00, 0xd0, 0x4f, 0x00, 0x00, 0x00, 0x00],
+};
+
+/// Series X's graphics heap (+0x61862b8): what [`GRAPHICS_HEAP`] becomes for
+/// an output larger than 1920x1080.
+pub const SERIES_X_GRAPHICS_HEAP: u64 = 0x8970_0000;
+
+/// +0x1d488ac, in +0x1d488a0: the render targets' area in 64 KiB units,
+/// `mov eax, 0x1290` (297 MB, Series S, for 1920x1080) or 0x2c60 (710 MB,
+/// Series X, for 3840x2160) by the console check. A layout that needs more
+/// stops at an `int3` (+0x2473e88): 374 MB at 2560x1440 on Series S (scar10).
+pub const TARGET_AREA: Site = Site {
+    at: 0x1d488ac,
+    what: "Series S render target area",
+    bytes: &[0xb8, 0x90, 0x12, 0x00, 0x00],
+};
+
+/// The render target area for a `w`x`h` output in 64 KiB units, scaled as
+/// [`pool_size`] scales the pool; `None` when stock is enough.
+pub fn target_area(w: u32, h: u32) -> Option<u32> {
+    const STOCK: u64 = 0x1290;
+    let (area, stock_area) = (u64::from(w) * u64::from(h), 1920 * 1080);
+    if area <= stock_area {
+        return None;
+    }
+    let units = (STOCK * area * 5).div_ceil(stock_area * 4).max(STOCK);
+    // (shifted left by 16 in 32 bits there)
+    u32::try_from(units).ok().filter(|&u| u < 0x1_0000)
+}
+
+/// What goes at [`TARGET_AREA`].
+pub fn target_area_code(units: u32) -> Vec<u8> {
+    let mut c = TARGET_AREA.bytes.to_vec();
+    c[1..5].copy_from_slice(&units.to_le_bytes());
+    c
+}
+
 /// What goes at [`POOL_CHECK`]: `jmp +1` in place of `jbe +1`.
 pub fn pool_check_code() -> Vec<u8> {
     let mut c = POOL_CHECK.bytes[..8].to_vec();
@@ -423,6 +470,11 @@ pub unsafe fn apply_asked(base: usize, size: usize, upscaler: Option<Upscaler>) 
         }
         if let Some(pool) = pool_size(w, h) {
             asked.push((&POOL_SIZE, pool_size_code(pool), format!("{} MB for {w}x{h}", pool >> 20)));
+            let heap = SERIES_X_GRAPHICS_HEAP;
+            asked.push((&GRAPHICS_HEAP, heap.to_le_bytes().to_vec(), format!("{} MB (Series X's) for {w}x{h}", heap >> 20)));
+        }
+        if let Some(units) = target_area(w, h) {
+            asked.push((&TARGET_AREA, target_area_code(units), format!("{} MB for {w}x{h}", units >> 4)));
         }
     }
     if let Some(up) = upscaler {
@@ -557,6 +609,13 @@ mod tests {
         assert_eq!(pool_size(3840, 2160), Some(410 << 20));
         let c = pool_size_code(184 << 20);
         assert_eq!(c, [0xb8, 0, 0, 0x80, 0x0b, 0xb9, 0, 0, 0x80, 0x0b]);
+        assert_eq!(u64::from_le_bytes(GRAPHICS_HEAP.bytes.try_into().unwrap()) >> 20, 1277);
+        assert_eq!(SERIES_X_GRAPHICS_HEAP >> 20, 2199);
+        assert_eq!(target_area(1920, 1080), None);
+        // 4752 units x 16/9 x 5/4 = 10560 (660 MB); 4K 23760 (1485 MB).
+        assert_eq!(target_area(2560, 1440), Some(10560));
+        assert_eq!(target_area(3840, 2160), Some(23760));
+        assert_eq!(target_area_code(10560), [0xb8, 0x40, 0x29, 0, 0]);
     }
 
     /// DLSS's code for FidelityFX's render size: the mode noted, the scaled
