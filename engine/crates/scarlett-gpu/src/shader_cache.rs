@@ -129,9 +129,112 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| scarlett_shader::emit::translate(c).map_err(|e| e.to_string());
-    match CACHE.get() {
+    let ours = match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
+    };
+    paired(container, ours)
+}
+
+/// Paired wave64 code from another translator (ports branch, after pepezin-ai's
+/// `paired_override`, f110b577). `SCARLETT_PAIRED_SHADER_DIR=<dir>` holds `<hash>.vsh`
+/// entries in this file's encoding, made by fxceless's translator in its paired form
+/// (each host thread runs console lanes n and n+32: PiloteCode's form, fxceless #1397):
+/// on 32-lane cards our wave-wide form of the volumetric water light draws dark tiles and
+/// a black screen under water, and the hair shadow masks have no 32-lane form here at
+/// all. An entry's code replaces ours only for a compute program on a 32-lane host with
+/// the views capped at one million and no raw twins (what the entries were made for),
+/// and only when everything else it binds equals our own translation: the one served,
+/// or, where we have none, the program as a 64-lane host would bind it.
+fn paired(container: &[u8], ours: Result<HostShader, String>) -> Result<HostShader, String> {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+    static DIR: OnceLock<Option<(PathBuf, HashSet<String>)>> = OnceLock::new();
+    let Some((dir, hashes)) = DIR.get_or_init(|| {
+        let dir = PathBuf::from(std::env::var_os("SCARLETT_PAIRED_SHADER_DIR")?);
+        let hashes: HashSet<String> = std::fs::read_dir(&dir)
+            .ok()?
+            .filter_map(|e| {
+                let name = e.ok()?.file_name().into_string().ok()?;
+                let hash = name.strip_suffix(".vsh")?;
+                (hash.len() == 16).then(|| hash.to_ascii_lowercase())
+            })
+            .collect();
+        let settings = scarlett_shader::emit::host_settings();
+        if settings[..4] != [32, 999_999, 0, 0] {
+            tracing::warn!(?settings, "paired shaders: made for a 32-lane host with 1,000,000 views; not used");
+            return None;
+        }
+        tracing::info!(dir = %dir.display(), entries = hashes.len(), "paired shaders");
+        Some((dir, hashes))
+    }) else {
+        return ours;
+    };
+    let digest = blake3::hash(container).to_hex();
+    let hash = &digest.as_str()[..16];
+    if !hashes.contains(hash) {
+        return ours;
+    }
+    static DONE: OnceLock<Mutex<HashMap<String, Option<HostShader>>>> = OnceLock::new();
+    let done = DONE.get_or_init(Default::default);
+    if let Some(known) = done.lock().unwrap_or_else(|e| e.into_inner()).get(hash) {
+        return known.clone().ok_or(()).or(ours);
+    }
+    let spliced = splice(dir, hash, container, ours.as_ref().ok());
+    done.lock().unwrap_or_else(|e| e.into_inner()).insert(hash.to_owned(), spliced.clone());
+    spliced.ok_or(()).or(ours)
+}
+
+fn splice(dir: &std::path::Path, hash: &str, container: &[u8], ours: Option<&HostShader>) -> Option<HostShader> {
+    let path = dir.join(format!("{hash}.vsh"));
+    let Some(theirs) = std::fs::read(&path).ok().and_then(|b| decode(&b)) else {
+        tracing::warn!(hash, path = %path.display(), "paired shader entry does not read");
+        return None;
+    };
+    if theirs.stage != HwStage::Cs || !theirs.dxil.starts_with(b"DXBC") {
+        tracing::warn!(hash, stage = ?theirs.stage, "paired shader entry is not a compute program");
+        return None;
+    }
+    // Everything but the code, against one of our translations.
+    let same = |ours: &HostShader| {
+        let mut ours = ours.clone();
+        ours.dxil.clone_from(&theirs.dxil);
+        ours == theirs
+    };
+    let differs = |ours: &HostShader| {
+        let mut d = Vec::new();
+        if ours.stage != theirs.stage { d.push("stage"); }
+        if ours.user_data != theirs.user_data { d.push("user_data"); }
+        if ours.samplers != theirs.samplers { d.push("samplers"); }
+        if ours.static_samplers != theirs.static_samplers { d.push("static_samplers"); }
+        if ours.root_cbvs != theirs.root_cbvs { d.push("root_cbvs"); }
+        if ours.root_srvs != theirs.root_srvs { d.push("root_srvs"); }
+        if ours.root_uavs != theirs.root_uavs { d.push("root_uavs"); }
+        if ours.root_indexed_views != theirs.root_indexed_views { d.push("root_indexed_views"); }
+        d.join(",")
+    };
+    if let Some(ours) = ours {
+        if same(ours) {
+            tracing::info!(hash, "paired wave64 code used (bindings equal ours)");
+            return Some(theirs);
+        }
+        tracing::info!(hash, differs = %differs(ours), "paired shader: our form binds differently; trying the 64-lane one");
+        tracing::debug!(hash, ours = ?ours.user_data, theirs = ?theirs.user_data, "paired shader bindings");
+    }
+    match scarlett_shader::emit::with_host_wave(64, || scarlett_shader::emit::translate(container)) {
+        Ok(wide) if same(&wide) => {
+            tracing::info!(hash, "paired wave64 code used (bindings equal our 64-lane form)");
+            Some(theirs)
+        }
+        Ok(wide) => {
+            tracing::warn!(hash, differs = %differs(&wide), "paired shader binds differently from ours; not used");
+            tracing::debug!(hash, ours = ?wide.user_data, theirs = ?theirs.user_data, ours_uavs = ?wide.root_uavs, theirs_uavs = ?theirs.root_uavs, "paired shader bindings");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(hash, error = %e, "paired shader: no translation of ours to compare with; not used");
+            None
+        }
     }
 }
 

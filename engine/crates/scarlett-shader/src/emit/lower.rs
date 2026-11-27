@@ -1369,7 +1369,30 @@ pub(super) fn host_max_wave() -> u32 {
     if let Some(lanes) = TEST_HOST_WAVE.get() {
         return lanes;
     }
+    if let Some(lanes) = THREAD_HOST_WAVE.get() {
+        return lanes;
+    }
     HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    /// [`with_host_wave`]'s wave size, for its thread only.
+    static THREAD_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` (a translation) as for a host whose waves are at most `lanes` wide, on this
+/// thread only. For what a program binds, not for code this host runs: the paired splice
+/// (`scarlett-gpu`'s shader cache) compares another translator's entry against the
+/// program as a 64-lane host would bind it when no 32-lane form of ours exists.
+pub fn with_host_wave<T>(lanes: u32, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<u32>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            THREAD_HOST_WAVE.set(self.0);
+        }
+    }
+    let _restore = Restore(THREAD_HOST_WAVE.replace(Some(lanes)));
+    f()
 }
 
 #[cfg(test)]
