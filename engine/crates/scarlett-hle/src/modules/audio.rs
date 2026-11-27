@@ -103,14 +103,21 @@ impl Heap {
 /// Zeroed host memory and its device address.
 fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
     let layout = Layout::from_size_align(size.max(1), align.max(16)).ok()?;
-    let mut heap = lock(&HEAP);
-    let apu = heap.take(u32::try_from(layout.size()).ok()?, align as u32)?;
+    let bytes = u32::try_from(layout.size()).ok()?;
+    // Zeroed before the lock is taken: the decoder and the title's mixer
+    // take it for every block (megabytes zeroed under it held them up).
     // SAFETY: non-zero size.
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
     if ptr.is_null() {
-        heap.give_back(apu, apu + layout.size() as u32);
         return None;
     }
+    let mut heap = lock(&HEAP);
+    let Some(apu) = heap.take(bytes, align as u32) else {
+        drop(heap);
+        // SAFETY: allocated just above with this layout.
+        unsafe { std::alloc::dealloc(ptr, layout) };
+        return None;
+    };
     heap.blocks
         .insert(ptr as usize, Block { size, apu, layout });
     heap.by_apu.insert(apu, ptr as usize);
@@ -493,15 +500,26 @@ impl Xma {
     }
 
     /// Fills every enabled context's output as far as it has room.
+    /// A few blocks a voice at a time, round after round, so that no voice's
+    /// lock is held for a whole ring (the mixer takes it to move its read
+    /// block on) and every voice gets its next blocks before any gets many.
     fn pump(&self) {
         let start = Instant::now();
         let mut active = 0;
-        for index in 0..self.voices.len() as u32 {
-            if let (Some(context), Some(voice)) =
-                (self.context(index), &mut *lock(&self.voices[index as usize]))
-            {
-                pump(context, voice);
-                active += 1;
+        let mut first = true;
+        loop {
+            let mut more = false;
+            for index in 0..self.voices.len() as u32 {
+                if let (Some(context), Some(voice)) =
+                    (self.context(index), &mut *lock(&self.voices[index as usize]))
+                {
+                    more |= pump(context, voice, BLOCKS_PER_HOLD);
+                    active += u32::from(first);
+                }
+            }
+            first = false;
+            if !more {
+                break;
             }
         }
         let took = start.elapsed();
@@ -511,12 +529,23 @@ impl Xma {
     }
 }
 
-fn pump(context: Context, voice: &mut Voice) {
+/// Blocks a voice is filled with while its lock is held, a round of
+/// [`Xma::pump`].
+const BLOCKS_PER_HOLD: u32 = 2;
+
+/// Fills up to `most` blocks of the voice's ring; true when it stopped for
+/// that alone (room and input left).
+fn pump(context: Context, voice: &mut Voice, most: u32) -> bool {
     let size = context.field(0, 22, 5);
     if size == 0 {
-        return;
+        return false;
     }
+    let mut filled = 0;
     while context.field(1, 31, 1) == 1 {
+        if filled == most {
+            return true;
+        }
+        filled += 1;
         // A skipped frame or an input boundary can advance the decoder without
         // producing samples. Publish only complete blocks, except the final
         // padded tail. Limit empty steps so a broken looping voice cannot hold
@@ -527,14 +556,14 @@ fn pump(context: Context, voice: &mut Voice) {
             }
         }
         if voice.pcm.is_empty() || (voice.pcm.len() < SAMPLES_PER_BLOCK && !voice.ended) {
-            return;
+            return false;
         }
         // The write block is the title's too: taken modulo the ring before
         // the first write, which would otherwise land past the ring's end.
         let write = context.field(0, 27, 5) % size;
         let address = context.get(7) as usize + write as usize * BLOCK_BYTES;
         let Some(out) = heap_bytes(address as u32, BLOCK_BYTES) else {
-            return;
+            return false;
         };
         for pair in out.as_chunks_mut::<2>().0 {
             let sample = voice.pcm.pop_front().unwrap_or(0);
@@ -553,6 +582,7 @@ fn pump(context: Context, voice: &mut Voice) {
             context.set_field(1, 31, 1, 0);
         }
     }
+    false
 }
 
 /// Decodes the next frame of the current input into `voice.pcm`; false
@@ -682,6 +712,30 @@ fn dump_input(index: u32, context: Context) {
     let _ = std::fs::write(dir.join(format!("{n:02}-{index}.xma")), input.unwrap_or_default());
 }
 
+/// The decoder's thread runs as the console's audio hardware does, ahead of
+/// everything else: time critical, in the multimedia scheduler's "Pro Audio"
+/// class. At normal priority our above-normal GPU workers took the cores
+/// from it while it held a voice's lock, and the title's time-critical mixer
+/// waited on that lock in `advance_read` and missed its block: audio
+/// stuttered when the frame rate fell (scar12).
+fn decoder_priority() {
+    use windows_sys::Win32::System::Threading::{
+        AVRT_PRIORITY_HIGH, AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority, GetCurrentThread,
+        SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+    };
+    let class: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
+    let mut task = 0u32;
+    // SAFETY: the calling thread; a NUL-terminated class name.
+    let mmcss = unsafe { AvSetMmThreadCharacteristicsW(class.as_ptr(), &mut task) };
+    if !mmcss.is_null() {
+        // SAFETY: the handle just returned.
+        unsafe { AvSetMmThreadPriority(mmcss, AVRT_PRIORITY_HIGH) };
+    }
+    // SAFETY: the calling thread.
+    let set = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
+    tracing::info!(mmcss = !mmcss.is_null(), time_critical = set != 0, "XMA decoder thread started");
+}
+
 /// Starts the decoding thread on the first enabled voice, and has it fill
 /// rings now: a voice just enabled or read from.
 fn wake_decoder() {
@@ -691,6 +745,7 @@ fn wake_decoder() {
             std::thread::Builder::new()
                 .name("scarlett XMA decoder".into())
                 .spawn(|| {
+                    decoder_priority();
                     loop {
                         xma().pump();
                         // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
