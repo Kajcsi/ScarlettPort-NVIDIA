@@ -195,6 +195,15 @@ fn splice(dir: &std::path::Path, hash: &str, container: &[u8], ours: Option<&Hos
         tracing::warn!(hash, stage = ?theirs.stage, "paired shader entry is not a compute program");
         return None;
     }
+    // An entry its maker could not pair comes out as a 64-lane program (the
+    // decal trail and particle emitters, scar7): a 32-lane card refuses its
+    // pipeline, so it is no better than ours.
+    if let Some((least, _)) = wave_lanes(&theirs.dxil)
+        && least > 32
+    {
+        tracing::warn!(hash, least, "paired shader entry needs waves of 64 lanes (not paired); not used");
+        return None;
+    }
     // Everything but the code, against one of our translations.
     let same = |ours: &HostShader| {
         let mut ours = ours.clone();
@@ -236,6 +245,22 @@ fn splice(dir: &std::path::Path, hash: &str, container: &[u8], ours: Option<&Hos
             None
         }
     }
+}
+
+/// The least and most wave lanes a DXIL container's pipeline state
+/// validation part (`PSV0`) asks for, if it says.
+fn wave_lanes(container: &[u8]) -> Option<(u32, u32)> {
+    let word = |at: usize| Some(u32::from_le_bytes(container.get(at..at + 4)?.try_into().ok()?));
+    let parts = word(28)? as usize;
+    (0..parts.min(64)).find_map(|n| {
+        let at = word(32 + 4 * n)? as usize;
+        (container.get(at..at + 4)? == b"PSV0").then_some(())?;
+        // the part's size, then the runtime info's size and the info: a
+        // 16-byte stage union, then the least and most wave lanes
+        let info = word(at + 8)? as usize;
+        (info >= 24).then_some(())?;
+        Some((word(at + 12 + 16)?, word(at + 12 + 20)?))
+    })
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -467,6 +492,32 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wave_lanes_read_from_the_psv_part() {
+        // header (32 bytes, 2 parts), the offsets, an SFI0 part, a PSV0 part
+        let mut c = b"DXBC".to_vec();
+        c.extend([0; 16]);
+        c.extend(1u32.to_le_bytes());
+        c.extend(0u32.to_le_bytes());
+        c.extend(2u32.to_le_bytes());
+        let first = 40u32;
+        let second = first + 16;
+        c.extend(first.to_le_bytes());
+        c.extend(second.to_le_bytes());
+        c.extend(b"SFI0");
+        c.extend(8u32.to_le_bytes());
+        c.extend(0u64.to_le_bytes());
+        c.extend(b"PSV0");
+        c.extend(32u32.to_le_bytes());
+        c.extend(24u32.to_le_bytes());
+        c.extend([0; 16]);
+        c.extend(64u32.to_le_bytes());
+        c.extend(64u32.to_le_bytes());
+        assert_eq!(wave_lanes(&c), Some((64, 64)));
+        assert_eq!(wave_lanes(&c[..60]), None);
+        assert_eq!(wave_lanes(b"DXBC"), None);
+    }
 
     fn shader() -> HostShader {
         HostShader {
