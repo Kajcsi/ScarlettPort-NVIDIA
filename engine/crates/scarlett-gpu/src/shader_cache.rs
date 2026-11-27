@@ -135,7 +135,10 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| scarlett_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        scarlett_shader::emit::with_paired_first(paired_first(c), || scarlett_shader::emit::translate(c))
+            .map_err(|e| e.to_string())
+    };
     let ours = match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
@@ -268,6 +271,13 @@ fn wave_lanes(container: &[u8]) -> Option<(u32, u32)> {
         (info >= 24).then_some(())?;
         Some((word(at + 12 + 16)?, word(at + 12 + 20)?))
     })
+}
+
+/// Whether `container` is one of the programs named in `SCARLETT_WAVE_PAIRED_FOR` (as in
+/// `SCARLETT_WAVE_WIDE_FOR`): those may take the paired form
+/// (`scarlett_shader::emit::with_paired_first`). Off unless named.
+fn paired_first(container: &[u8]) -> bool {
+    scarlett_shader::emit::paired_names_any() && scarlett_shader::emit::paired_named(&blake3::hash(container).to_hex())
 }
 
 /// The cache entry's converter: the build and the container in, the
