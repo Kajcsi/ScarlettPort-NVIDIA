@@ -279,6 +279,19 @@ pub(crate) const BAKE_PIXEL_SHADERS: [&str; 7] = [
 /// permutations beyond `BAKE_PIXEL_SHADERS`.
 const BAKE_GEOMETRY_SHADERS: [&str; 2] = ["089d6271be6650ef", "d4111a6e6ea49d91"];
 
+/// Whether `shader` is a program of the title's decoration bake.
+fn bake_shader(shader: &crate::pipeline::Shader) -> bool {
+    let h = shader.hash.as_str();
+    BAKE_PIXEL_SHADERS.contains(&h) || BAKE_GEOMETRY_SHADERS.contains(&h)
+}
+
+/// Whether a draw with the title pipeline `pipeline` bound gets the pass of
+/// its own ahead of a bake ([`State::early_textures`]): written-down lists
+/// (`crate::list::thin`) translate such draws at the title's call.
+pub(crate) fn bake_pipeline(pipeline: This) -> bool {
+    early_budgets().1 > 0 && crate::pipeline::shaders_any(pipeline, bake_shader)
+}
+
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
 pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
