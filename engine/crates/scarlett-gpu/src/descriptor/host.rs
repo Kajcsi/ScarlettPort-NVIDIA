@@ -4205,16 +4205,6 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
-    // A typed unordered view in a format the host cannot store to
-    // (B5G5R5A1_UNORM on NVIDIA) removes the device when made, in the
-    // texture's own format too: the slot stays null, its writes dropped.
-    // The format checked is the one the view is made in: a typed
-    // texture's own unless the requested one is castable (below).
-    let typed = if view == 0 || (!typeless && !castable.contains(&view)) { own } else { view };
-    if unordered && !(view == 0 && typeless) && !typed_store(typed) {
-        once!(view = typed, own, "an unordered view in a format the host cannot store");
-        return false;
-    }
 ) -> Option<Kept> {
     let mut shadow = crate::shadow::find(address, len)?;
     let unit = {
