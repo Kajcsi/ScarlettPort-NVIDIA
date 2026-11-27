@@ -203,6 +203,38 @@ pub const POOL_CHECK: Site = Site {
     bytes: &[0x48, 0x3d, 0xff, 0xff, 0x1f, 0x00, 0x76, 0x01, 0xcc], // cmp rax, 1FFFFFh ; jbe +1 ; int3
 };
 
+/// +0x247ad45: the back buffers' pool size, `mov eax, 82 MB; mov ecx, 64 MB`
+/// (the console check then picks one of them). The pool is a bump allocator
+/// (+0x56a2a8b) that stops at an `int3` when a buffer does not fit, and its
+/// 82 MB are sized for 1920x1080: at 2560x1440 each buffer is 15 MB and
+/// the pool ran out with 3.25 MB left (scar8).
+pub const POOL_SIZE: Site = Site {
+    at: 0x247ad45,
+    what: "back buffer pool's size",
+    bytes: &[0xb8, 0x00, 0x00, 0x20, 0x05, 0xb9, 0x00, 0x00, 0x00, 0x04],
+};
+
+/// The pool size for a `w`x`h` output: the larger stock size scaled by the
+/// output's area over 1920x1080's with a quarter more room, rounded up to
+/// 2 MB; never below stock. `None` when stock is enough (1920x1080 or less).
+pub fn pool_size(w: u32, h: u32) -> Option<u32> {
+    const STOCK: u64 = 0x520_0000;
+    let (area, stock_area) = (u64::from(w) * u64::from(h), 1920 * 1080);
+    if area <= stock_area {
+        return None;
+    }
+    let size = (STOCK * area * 5 / (stock_area * 4)).next_multiple_of(2 << 20);
+    u32::try_from(size.max(STOCK)).ok()
+}
+
+/// What goes at [`POOL_SIZE`]: both sizes become `size`.
+pub fn pool_size_code(size: u32) -> Vec<u8> {
+    let mut c = POOL_SIZE.bytes.to_vec();
+    c[1..5].copy_from_slice(&size.to_le_bytes());
+    c[6..10].copy_from_slice(&size.to_le_bytes());
+    c
+}
+
 /// What goes at [`POOL_CHECK`]: `jmp +1` in place of `jbe +1`.
 pub fn pool_check_code() -> Vec<u8> {
     let mut c = POOL_CHECK.bytes[..8].to_vec();
@@ -389,6 +421,9 @@ pub unsafe fn apply_asked(base: usize, size: usize, upscaler: Option<Upscaler>) 
         if (w, h) != (3840, 2160) {
             asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
         }
+        if let Some(pool) = pool_size(w, h) {
+            asked.push((&POOL_SIZE, pool_size_code(pool), format!("{} MB for {w}x{h}", pool >> 20)));
+        }
     }
     if let Some(up) = upscaler {
         // DLSS through the title's FidelityFX path: these three sites are its.
@@ -510,6 +545,18 @@ mod tests {
         assert!(changed.iter().all(|&i| (0x2c..0x30).contains(&i) || (0x36..0x3a).contains(&i) || (0x64..0x68).contains(&i)));
         assert_eq!(picker_code(7), [0xb8, 7, 0, 0, 0, 0xc3]);
         assert_eq!(pool_check_code(), [0x48, 0x3d, 0xff, 0xff, 0x1f, 0x00, 0xeb, 0x01]);
+    }
+
+    /// The back buffer pool grows with the output's area, never shrinks.
+    #[test]
+    fn the_pool_size_follows_the_output() {
+        assert_eq!(pool_size(1920, 1080), None);
+        assert_eq!(pool_size(1280, 720), None);
+        // 82 MB x 16/9 x 5/4 = 182.2 MB, to 184 MB.
+        assert_eq!(pool_size(2560, 1440), Some(184 << 20));
+        assert_eq!(pool_size(3840, 2160), Some(410 << 20));
+        let c = pool_size_code(184 << 20);
+        assert_eq!(c, [0xb8, 0, 0, 0x80, 0x0b, 0xb9, 0, 0, 0x80, 0x0b]);
     }
 
     /// DLSS's code for FidelityFX's render size: the mode noted, the scaled
