@@ -1,3 +1,48 @@
+# ScarlettPort-NVIDIA
+
+A fork of [ZigZagBoi1/ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort) aimed at NVIDIA cards, with performance, rendering and audio fixes.
+
+This is an unofficial fan project. It is not affiliated with or endorsed by Rockstar Games, Take-Two Interactive, Microsoft or NVIDIA. **It contains no game files.** You need your own legally purchased copy of the game. Online play and paid content are not supported.
+
+## What this fork changes
+
+- **DLSS** through NVIDIA Streamline, in place of the game's FidelityFX upscaler. Output above 1080p is supported.
+- **Performance**
+  - The game's vertex and constant memory can live in video memory through Resizable BAR, so the card no longer reads it over PCIe on every draw.
+  - The 32-bit graphics heap is no longer read in place from system memory.
+  - The write-tracking lock is shared, so write faults and refreshes don't queue behind each other.
+  - Fills that read bytes an earlier copy wrote in the same command list take those bytes directly.
+- **Rendering fixes**
+  - Black shapes in the world: writes made at one address of shared memory are passed on to its other addresses, and those textures are rechecked for as long as they exist.
+  - Red stair-step halos around characters: the ambient light pass weighs samples by depth.
+  - Black blocks on water: high texture slots are mirrored, and the game's used slots are kept in place.
+  - Sparse mip allocations are honoured.
+  - A 16-bit sign-extension shader fix.
+- **Audio**
+  - Voices in phone calls and under water: the audio effects module (FFT and convolution) is implemented instead of returning silence.
+  - Less stutter: the audio decoder thread runs at Pro Audio priority.
+- **Other fixes**
+  - Alt+Enter toggles borderless fullscreen.
+  - The game keeps running at full speed at low frame rates.
+  - Frame-rate switch timer fixes.
+- **Ported fixes** from related community forks. Each port names its source and author in the commit history.
+
+## Status
+
+Work in progress. Tested on a single NVIDIA RTX system at 1440p with ray tracing off. Expect bugs and lower frame rates than on console.
+
+## Building
+
+Build as described in the upstream README below.
+
+## Licence
+
+Same as upstream; see `LICENSE`.
+
+---
+
+*The upstream README follows.*
+
 <div align="center">
 
 # ScarlettPort
