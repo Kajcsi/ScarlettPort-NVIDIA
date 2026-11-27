@@ -39,10 +39,10 @@
 //! light seen on screen; the others go to the structures, find nothing, and
 //! `CS_RayMiss` gives each the sky's light from the sky's cube maps (in a
 //! cutscene frame, capture haze2: 10 to 30 against 0.01 to 0.1 for the room
-//! the eyes and floors are in, and blue). `SCARLETT_AMBIENT_SPECULAR` puts in,
-//! right after that program, the same estimate taken along the reflected
-//! direction ([`Role::Miss`]); the screen-space resolve that comes next
-//! still writes what it found over it.
+//! the eyes and floors are in, and blue). `SCARLETT_AMBIENT_SPECULAR` bounds,
+//! right after that program, what it wrote by the same estimate taken along
+//! the reflected direction ([`Role::Miss`]); the screen-space resolve that
+//! comes next still writes what it found over it.
 
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -137,10 +137,10 @@ pub(crate) fn on() -> bool {
 }
 
 /// `SCARLETT_AMBIENT_SPECULAR=<share>[,<sky>]`: reflections whose rays found
-/// nothing take `share` of the estimate along the reflected direction
-/// instead of the sky's light; `sky` (0 to 1, 0 if not given) of them stays
-/// the title's sky, made no brighter than the estimate. Unset or 0: the
-/// title's sky.
+/// nothing are made no brighter than 1.5 times `share` of the estimate along
+/// the reflected direction (the sky's light they get is 100 to 1000 times the
+/// room's); `sky` (0 to 1, 0 if not given) of them stays the title's sky as
+/// it was. Unset or 0: the title's sky.
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct Specular {
     share: f32,
@@ -284,7 +284,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float flat;
     float jump; float fresh; float dt;
 };
 Texture2D<float> depth : register(t0);
@@ -296,9 +296,14 @@ RWStructuredBuffer<float4> points : register(u2);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
+// With `flat` (no depth among the program's views but a stencil plane) every
+// point is taken 4 m away: the estimate is the light around, without creases.
 float3 seen(int2 p, float2 size) {
-    float d = depth.Load(int3(clamp(p, int2(0, 0), int2(size) - 1), 0));
-    float z = min(near / max(d, 1e-7), 1000.0);
+    float z = 4.0;
+    if (flat == 0.0) {
+        float d = depth.Load(int3(clamp(p, int2(0, 0), int2(size) - 1), 0));
+        z = min(near / max(d, 1e-7), 1000.0);
+    }
     float2 ndc = (float2(p) + 0.5) / size * 2.0 - 1.0;
     return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
 }
@@ -405,21 +410,10 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 
 #ifdef REFLECT
 RWTexture2D<float3> reflected : register(u0);
-// Each texel of the reflections' image (half the picture's size): the light
-// the points around send along the reflected direction, as `raise` takes it
-// along the normal; `level` is the share, `constant` the share of the
-// title's sky kept, made no brighter than that.
-[RootSignature(RS)]
-[numthreads(8, 8, 1)]
-void reflect_light(uint3 at : SV_DispatchThreadID) {
-    uint w, h;
-    reflected.GetDimensions(w, h);
-    if (at.x >= w || at.y >= h) return;
-    float2 size = float2(width, height);
-    int2 p = int2((float2(at.xy) + 0.5) * size / float2(w, h));
-    float3 c = seen(p, size);
-    // Nothing is reflected by the sky.
-    if (c.z >= 999.0) return;
+// The light the points around send along the direction the view reflects
+// to at the point `c` seen at `p` (as `raise` takes it along the normal),
+// `level` its share.
+float3 reflected_estimate(int2 p, float3 c, float2 size) {
     float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
     float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
     float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
@@ -449,13 +443,45 @@ void reflect_light(uint3 at : SV_DispatchThreadID) {
     // for an even spread of directions, a little less for a smooth image.
     float3 found = all + 2.0 * float3(dot(sr.xyz, ray), dot(sg.xyz, ray), dot(sb.xyz, ray)) / sum;
     found = clamp(found, 0.1 * all, 3.0 * all);
-    found = lerp(found, cells[CELLS].rgb, 0.2) * level;
-    found = any(isnan(found)) || any(isinf(found)) ? 0.0 : max(found, 0.0);
+    return lerp(found, cells[CELLS].rgb, 0.2) * level;
+}
+// Each texel of the reflections' image (half the picture's size): what the
+// title put there (the sky's light, for every ray that found nothing) is
+// bounded by REFLECT_MOST times the estimate. Only what is brighter than
+// that changes, towards the estimate's colour as the cut grows: no texel is
+// made darker than the light around it or brighter than the title had it,
+// and a texel the miss program did not write keeps its value. Replacing
+// every texel by the estimate (pepezin's 2db59d48) went with rooms black and
+// sparkling in run scar4. `constant` is the share of the title's value kept
+// as it was.
+#define REFLECT_MOST 1.5
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void reflect_light(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    reflected.GetDimensions(w, h);
+    if (at.x >= w || at.y >= h) return;
     float3 was = reflected[at.xy];
     was = any(isnan(was)) || any(isinf(was)) ? 0.0 : max(was, 0.0);
     float has = dot(was, LUMA);
-    was *= min(1.0, dot(found, LUMA) / max(has, 1e-6));
-    reflected[at.xy] = lerp(found, was, constant);
+    float2 size = float2(width, height);
+    int2 p = int2((float2(at.xy) + 0.5) * size / float2(w, h));
+    float3 c = seen(p, size);
+    // The sky at the texel's place in the picture (at half size, an edge
+    // between a surface and the sky): the light around, as the last seconds
+    // showed it. (Kept as the title had it, such edges sparkled with the
+    // sky's light.)
+    float3 found = c.z >= 999.0 ? cells[CELLS].rgb * level : reflected_estimate(p, c, size);
+    found = any(isnan(found)) || any(isinf(found)) ? 0.0 : max(found, 0.0);
+    float lf = dot(found, LUMA);
+    float top = max(lf * REFLECT_MOST, 1e-6);
+    float3 kept = was;
+    if (has > top) {
+        float3 dimmed = was * (top / has);
+        float3 tinted = lf > 1e-6 ? found * (top / lf) : dimmed;
+        kept = lerp(dimmed, tinted, saturate(log2(has / top) / 4.0));
+    }
+    reflected[at.xy] = lerp(kept, was, constant);
 }
 #endif
 
@@ -648,6 +674,9 @@ pub(crate) struct Views {
     pub(crate) slices: u32,
     /// The size of the depth (the image's but for [`Role::Miss`]).
     pub(crate) depth_size: [u32; 2],
+    /// `depth` is a stencil plane, no depth: every point is taken at one
+    /// distance (the estimate is the light around, without creases).
+    pub(crate) flat: bool,
 }
 
 /// For the line every ten seconds: what the stand-in for reflections did.
@@ -791,6 +820,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = follow(role, settle).to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    words[11] = if views.flat { 1.0f32 } else { 0.0f32 }.to_bits();
     words[12] = settle.map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle.map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (frame_ms(role) / 1000.0).to_bits();

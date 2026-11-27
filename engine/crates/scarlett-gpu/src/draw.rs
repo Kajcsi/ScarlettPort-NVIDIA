@@ -3405,11 +3405,28 @@ impl State {
                 .filter_map(|u| entry(kind, (u.slot, u.table_offset_dwords)))
                 .find(|(desc, _)| fits(desc))
         };
+        // The rays' image of a miss program: a 2D R11G11B10 image at the
+        // usual place, else the only one of its tables. The first of several
+        // was taken before (e3503a90): in run scar4 the stand-in then ran
+        // while the eyes kept the sky's light and rooms went black, as if it
+        // wrote another of the program's images. Where it was found is
+        // logged once per program (`image_at`).
+        let r11 = |d: &D3D12_RESOURCE_DESC| d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Format.0 == 26;
+        let mut image_at = Some(at);
         let image = match role {
-            Role::Miss => entry(ResourceType::Uav, at).or_else(|| {
-                scan(ResourceType::Uav, &|d| {
-                    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Format.0 == 26
-                })
+            Role::Miss => entry(ResourceType::Uav, at).filter(|(d, _)| r11(d)).or_else(|| {
+                let mut fits = t
+                    .used
+                    .iter()
+                    .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
+                    .filter_map(|u| {
+                        let place = (u.slot, u.table_offset_dwords);
+                        entry(ResourceType::Uav, place).filter(|(d, _)| r11(d)).map(|e| (place, e))
+                    });
+                let first = fits.next();
+                let more = fits.next().is_some();
+                image_at = first.as_ref().filter(|_| !more).map(|(place, _)| *place);
+                first.filter(|_| !more).map(|(_, e)| e)
             }),
             _ => entry(ResourceType::Uav, at),
         };
@@ -3424,11 +3441,26 @@ impl State {
                 entry(ResourceType::Srv, at)
             }
         };
+        // With nothing but a stencil plane, the diffuse stand-in still runs,
+        // every point at one distance (`Views::flat`): skipped, it left the
+        // walls of rooms black, as the title has them without rays (and the
+        // probes' old memory in blocks).
+        let mut flat = false;
         let depth = match role {
-            Role::Resolve => usual_depth(DEPTH).or_else(|| {
-                let size = image.as_ref().map(|(d, _)| (d.Width, d.Height));
-                scan(ResourceType::Srv, &|d| depth_like(d) && size == Some((d.Width, d.Height)))
-            }),
+            Role::Resolve => usual_depth(DEPTH)
+                .or_else(|| {
+                    let size = image.as_ref().map(|(d, _)| (d.Width, d.Height));
+                    scan(ResourceType::Srv, &|d| depth_like(d) && size == Some((d.Width, d.Height)))
+                })
+                .or_else(|| {
+                    let plane = entry(ResourceType::Srv, DEPTH)?;
+                    flat = true;
+                    static FLAT: AtomicU64 = AtomicU64::new(0);
+                    if FLAT.fetch_add(1, Ordering::Relaxed) == 0 {
+                        tracing::info!(target: "scarlett_gpu::ambient", "the diffuse stand-in found only a stencil plane: it runs with every point at one distance (logged once)");
+                    }
+                    Some(plane)
+                }),
             Role::Miss => usual_depth(MISS_DEPTH)
                 .filter(|(d, _)| {
                     image.as_ref().is_some_and(|(i, _)| {
@@ -3491,7 +3523,7 @@ impl State {
                             }
                         })
                         .collect();
-                    tracing::info!(program = %p.name, tables = %held.join("; "), "reflections stand-in: a miss program whose rays' image or depth was not found");
+                    tracing::info!(target: "scarlett_gpu::ambient", program = %p.name, tables = %held.join("; "), "reflections stand-in: a miss program whose rays' image or depth was not found");
                 }
             }
             return false;
@@ -3533,9 +3565,26 @@ impl State {
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
             depth_size: [seen.Width as u32, seen.Height],
+            flat,
         });
         if ran && role == Role::Miss {
             crate::ambient::note_miss(MissNote::Ran(layer));
+            // Once per program: where its rays' image was found and what it
+            // and the depth are, so a run shows which images it writes.
+            static NAMED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            let mut named = NAMED.lock().unwrap_or_else(|e| e.into_inner());
+            if named.len() < 32 && !named.contains(&p.name) {
+                named.push(p.name.clone());
+                tracing::info!(
+                    target: "scarlett_gpu::ambient",
+                    program = %p.name,
+                    layer,
+                    image_at = ?image_at,
+                    image = ?(of.Width, of.Height),
+                    depth = ?(seen.Width, seen.Height, seen.Format.0),
+                    "reflections stand-in: a miss program it follows"
+                );
+            }
         }
         ran
     }

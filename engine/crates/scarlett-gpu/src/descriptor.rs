@@ -217,6 +217,8 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     STARTED.call_once(|| {
         let made = std::thread::Builder::new().name("scarlett-heap-sync".into()).spawn(|| {
             crate::cores::keep_on_fast_cores("scarlett-heap-sync");
+            // (The submitting thread waits for its rounds.)
+            let mut priority = crate::cores::Priority::new();
             let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
             /// A round is over, however it ends.
             struct Over;
@@ -245,6 +247,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                     }
                 }
                 drop(r);
+                priority.keep();
                 let _over = asked.then(|| {
                     last = std::time::Instant::now();
                     Over
@@ -272,8 +275,6 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
 impl Drop for SyncedHeaps {
     fn drop(&mut self) {
         let Some(mine) = self.0 else {
-            // (The submitting thread waits for its rounds.)
-            let mut priority = crate::cores::Priority::new();
             return;
         };
         let began = std::time::Instant::now();
@@ -302,7 +303,6 @@ pub(crate) fn sync_heaps() {
         return;
     }
     let started = std::time::Instant::now();
-                priority.keep();
     let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut views, mut bytes) = (0u64, 0u64);
     let mut spent = [0u64; 3];
