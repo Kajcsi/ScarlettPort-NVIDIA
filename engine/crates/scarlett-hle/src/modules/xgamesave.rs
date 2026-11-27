@@ -319,6 +319,11 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let Some((name, display, blobs)) = load(&version)? else {
             continue;
         };
+        // Older versions go as far as they can. The newest readable one is
+        // the container whatever is left below it, and a file another
+        // program holds without letting it be deleted fails the removal:
+        // returning that error made every save fail for as long as it was
+        // held (while a virus scanner or a backup had it open).
         for old in &committed[at + 1..] {
             discard(&dir.join(format!("v{old}")));
         }
@@ -1118,6 +1123,52 @@ mod tests {
         // Replacing a blob of the same size fits a full quota.
         assert_eq!(no_room(mb, mb, QUOTA, 100 * mb), None);
         assert_eq!(no_room(mb, 0, 0, mb), None);
+    }
+
+    /// A file of an older version held by another program (a virus scanner,
+    /// a backup copy in progress) keeps that version from being removed.
+    /// The saves after it must not fail for that: the newest readable
+    /// version is the container whatever is left below it, and what is left
+    /// goes at a later save.
+    #[cfg(windows)]
+    #[test]
+    fn an_older_version_that_cannot_be_removed_does_not_fail_the_saves_after_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = container_dir(root.path(), "Slot");
+        let versions = || {
+            let entries = std::fs::read_dir(&dir).unwrap().flatten();
+            entries
+                .filter(|e| e.file_name().to_string_lossy().starts_with('v'))
+                .count()
+        };
+        assert_eq!(update(root.path(), "one", &[("a", Some("first a"))]), S_OK);
+        let first = current(&dir).unwrap().unwrap();
+        // Opened with no sharing: nobody else can delete it while it is held.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(first.blob(0))
+            .unwrap();
+        assert_eq!(update(root.path(), "two", &[("a", Some("second a"))]), S_OK);
+        assert_eq!(
+            state(root.path()),
+            Some(("two".into(), vec![("a".into(), "second a".into())]))
+        );
+        assert_eq!(update(root.path(), "three", &[("a", Some("third a"))]), S_OK);
+        assert_eq!(
+            state(root.path()),
+            Some(("three".into(), vec![("a".into(), "third a".into())]))
+        );
+        assert!(first.blob(0).exists(), "the held file is still there");
+        // Let go of: the next look at the container removes what was left.
+        drop(held);
+        assert_eq!(update(root.path(), "four", &[("a", Some("fourth a"))]), S_OK);
+        assert_eq!(
+            state(root.path()),
+            Some(("four".into(), vec![("a".into(), "fourth a".into())]))
+        );
+        assert_eq!(versions(), 1);
     }
 
     fn update(root: &Path, display: &str, changes: &[(&str, Option<&str>)]) -> HRESULT {
