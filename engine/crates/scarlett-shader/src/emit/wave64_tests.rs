@@ -1469,3 +1469,6 @@ fn a_set_up_in_one_arm_of_a_per_lane_branch_is_the_lanes_write() {
     w.extend(stores([3, 3, 3, 3]));
     assert_eq!(paired_setups(&native_with(&w, true, 64, 256), true).1, 0);
 }
+
+#[path = "paired_tests.rs"]
+mod paired;

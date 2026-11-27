@@ -67,6 +67,8 @@ fn build() -> [u8; 32] {
             "SCARLETT_WAVE_DEEP_SKIPS",
             "SCARLETT_WAVE_OWN_BITS",
             "SCARLETT_WAVE_LOCAL",
+            "SCARLETT_WAVE_PAIRED",
+            "SCARLETT_WAVE_PAIRED_FOR",
             "SCARLETT_F16_NEAREST",
             "SCARLETT_HELPER_OWN",
             "SCARLETT_FIRSTLANE_OWN",
