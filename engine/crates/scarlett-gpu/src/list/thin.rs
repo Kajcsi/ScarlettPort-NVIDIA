@@ -260,6 +260,23 @@ static WORK: Condvar = Condvar::new();
 static LIVE: Mutex<Vec<std::sync::Weak<Recording>>> = Mutex::new(Vec::new());
 /// Lists of ours nobody uses, closed.
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Back lists kept for reuse at most; more are let go of when they come back.
+const BACKS_MOST: usize = 64;
+
+/// Lets go of the kept back lists past `keep`.
+#[allow(dead_code)]
+pub(crate) fn trim_backs(keep: usize) {
+    let gone: Vec<usize> = {
+        let mut backs = held(&BACKS);
+        let n = backs.len().saturating_sub(keep);
+        backs.drain(..n).collect()
+    };
+    for ptr in gone {
+        // SAFETY: pointers in `BACKS` are owned boxed `List`s.
+        unsafe { drop(Box::from_raw(ptr as *mut List)) };
+    }
+}
+
 /// Since the last line of the log: streams handed over; calls translated and
 /// the microseconds that took (all threads), recordings translated, and
 /// recordings let go of in the middle; draws of the bake translated at the
@@ -421,7 +438,14 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            let mut backs = held(&BACKS);
+            if backs.len() < BACKS_MOST {
+                backs.push(inner.back);
+            } else {
+                drop(backs);
+                // SAFETY: owned boxed `List`.
+                unsafe { drop(Box::from_raw(inner.back as *mut List)) };
+            }
         }
     }
 }
