@@ -1045,6 +1045,24 @@ pub(crate) struct TextureQueue {
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
     held: std::collections::BTreeMap<u32, u64>,
+    /// Slots set aside until their next look, a long wait off
+    /// ([`TextureQueue::park`]): every pass walks [`TextureQueue::slots`]
+    /// under the queue's lock, and a slot looked at for as long as it stays
+    /// would be walked thousands of times between two looks. By slot, and
+    /// by the frame of the look ([`TextureQueue::wake`]).
+    parked: std::collections::BTreeMap<u32, Waiting>,
+    parked_due: std::collections::BTreeSet<(u64, u32)>,
+}
+
+/// The most parked slots one pass takes back ([`TextureQueue::wake`]),
+/// earliest first (`SCARLETT_PARKED_LOOKS`): a look reads up to 48 KiB, so
+/// one pass reads at most some 3 MB for them; with more of them due the
+/// rest wait for the next passes.
+fn parked_looks() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("SCARLETT_PARKED_LOOKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64)
+    })
 }
 
 impl TextureQueue {
@@ -1053,16 +1071,73 @@ impl TextureQueue {
     /// the host slot from a view the queue may hold already, which then
     /// stays as it is.
     fn written(&mut self, index: u32, frame: u64, due: u64, seen: bool) {
-        if seen && self.slots.contains_key(&index) {
+        if seen && (self.slots.contains_key(&index) || self.parked.contains_key(&index)) {
             return;
         }
+        self.unpark(index);
         self.writes += 1;
         let write = self.writes;
         self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: TextureRecheck::default() });
     }
 
     fn remove(&mut self, index: u32) {
-        self.slots.remove(&index);
+        self.take_out(index);
+    }
+
+    /// Slot `index` leaves the queue, parked or not; whether it was in it.
+    fn take_out(&mut self, index: u32) -> bool {
+        let queued = self.slots.remove(&index).is_some();
+        self.unpark(index).is_some() || queued
+    }
+
+    /// Slot `index`'s entry out of the parked ones, if it was there.
+    fn unpark(&mut self, index: u32) -> Option<Waiting> {
+        let w = self.parked.remove(&index)?;
+        self.parked_due.remove(&(w.due, index));
+        Some(w)
+    }
+
+    /// Slot `index` (as handed out with `write`) is looked at again from
+    /// frame `due` as by [`TextureQueue::recheck`], a long wait off: set
+    /// aside until then ([`TextureQueue::parked`]).
+    fn park(&mut self, index: u32, write: u64, due: u64, checked: TextureRecheck) {
+        if self.reschedule(index, write).is_none() {
+            return;
+        }
+        if let Some(mut w) = self.slots.remove(&index) {
+            (w.due, w.looks, w.mapped) = (due, 1, 0);
+            w.checked = checked;
+            self.parked_due.insert((due, index));
+            self.parked.insert(index, w);
+        }
+    }
+
+    /// The parked slots due at `frame` back among the others, earliest
+    /// first, at most `most` of them (a pass: [`parked_looks`]). Returns how
+    /// many.
+    fn wake(&mut self, frame: u64, most: usize) -> usize {
+        let mut woken = 0;
+        while woken < most {
+            match self.parked_due.first() {
+                Some(&(due, _)) if due <= frame => {}
+                _ => break,
+            }
+            let Some((_, index)) = self.parked_due.pop_first() else {
+                break;
+            };
+            if let Some(w) = self.parked.remove(&index) {
+                // (A slot queued again meanwhile left the parked ones; the
+                // newer entry stands if there is one all the same.)
+                self.slots.entry(index).or_insert(w);
+                woken += 1;
+            }
+        }
+        woken
+    }
+
+    /// Slots parked now.
+    fn parked_count(&self) -> usize {
+        self.parked.len()
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
@@ -1233,7 +1308,8 @@ impl TextureQueue {
     fn changed(&mut self, index: u32, frame: u64, due: u64) {
         self.writes += 1;
         let write = self.writes;
-        let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
+        let parked = self.unpark(index);
+        let due = self.slots.get(&index).or(parked.as_ref()).map_or(due, |w| w.due.min(due));
         self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: TextureRecheck::default() });
     }
 
@@ -2082,8 +2158,20 @@ impl HostHeap {
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
-        let (due, census) = self.textures.lock().unwrap_or_else(|e| e.into_inner()).due_and_census(frame);
+        let (due, census) = {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            // The parked slots whose look is due are handed out with them.
+            if max != 0 {
+                textures.wake(frame, parked_looks());
+            }
+            textures.due_and_census(frame)
+        };
         (if max == 0 { Vec::new() } else { due.order(max) }, census)
+    }
+
+    /// Slots parked until their next look ([`TextureQueue::park`]).
+    pub(crate) fn texture_slots_parked(&self) -> usize {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).parked_count()
     }
 
     /// A number that changes when a slot is written or made due anew, and
@@ -2124,6 +2212,13 @@ impl HostHeap {
     pub(crate) fn texture_slot_recheck(&self, index: u32, write: u64, due: u64, checked: TextureRecheck) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         textures.recheck(index, write, due, checked);
+    }
+
+    /// Title slot `index` was looked at and is looked at again from frame
+    /// `due`, a long wait off: see [`TextureQueue::park`].
+    pub(crate) fn texture_slot_park(&self, index: u32, write: u64, due: u64, checked: TextureRecheck) {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        textures.park(index, write, due, checked);
     }
 
     /// See [`TextureQueue::checked`].
@@ -2881,7 +2976,7 @@ impl HostHeap {
             stamp.store(now | TABLED_READ, Relaxed);
             if tabled_out() {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                if textures.slots.remove(&index).is_some() {
+                if textures.take_out(index) {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
             }
@@ -3711,7 +3806,10 @@ impl HostHeap {
     pub(crate) fn texture_slot_state(&self, index: u32, frame: u64) -> String {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         match textures.slots.get(&index) {
-            None => "not queued".into(),
+            None => match textures.parked.get(&index) {
+                Some(w) => format!("parked until @{} (looked at {} times unchanged)", w.due, w.checked.unchanged_looks),
+                None => "not queued".into(),
+            },
             Some(w) => format!(
                 "queued due={} written@{} looks={} part_mapped={} recheck={}",
                 if w.due <= frame { "now".to_string() } else { format!("@{}", w.due) },
@@ -5956,6 +6054,74 @@ mod tests {
         queue.recheck(1, write, 801, checked);
         assert_eq!(queue.due(402, 1), [(1, new_write)]);
         assert_eq!(queue.checked(1, new_write), None);
+    }
+
+    /// A slot looked at again only a long wait off is parked: no pass walks
+    /// it until its look is due, when it comes back as it was, the earliest
+    /// first and so many a pass; a write, a notice of its memory or a table
+    /// takes it out of the parked ones as out of the queue.
+    #[test]
+    fn parked_slots_come_back_for_their_look_and_leave_as_any_other() {
+        let mut q = TextureQueue::default();
+        let checked = |at: u64| TextureRecheck {
+            address: at,
+            bytes: 0x2000,
+            fingerprint: 7,
+            unchanged_looks: 4,
+            uploaded: 1,
+            changed_in_place: false,
+        };
+        for slot in 1..=5u32 {
+            q.written(slot, 1, 1, false);
+        }
+        let handed = q.due(1, 10);
+        assert_eq!(handed.len(), 5);
+        let write = |slot: u32| handed.iter().find(|d| d.0 == slot).unwrap().1;
+        // Slots 1-4 are parked, due at 401-404; slot 5 waits in the queue.
+        for slot in 1..=4u32 {
+            q.park(slot, write(slot), 400 + u64::from(slot), checked(u64::from(slot) << 16));
+        }
+        q.recheck(5, write(5), 41, checked(5 << 16));
+        assert_eq!(q.parked_count(), 4);
+        assert_eq!(q.census(u64::MAX), [1, 1, 1, 0, u64::MAX - 1], "only slot 5 is walked");
+        assert!(q.due(u64::MAX, 10).iter().all(|d| d.0 == 5));
+        // Not before their frame; then the earliest first, two a pass.
+        assert_eq!(q.wake(400, 2), 0);
+        assert_eq!(q.wake(403, 2), 2);
+        let now: Vec<u32> = q.due(403, 10).into_iter().map(|d| d.0).collect();
+        assert_eq!(now, [5, 2, 1]);
+        // As they were handed out and parked.
+        assert_eq!(q.checked(1, write(1)), Some(checked(1 << 16)));
+        assert_eq!(q.wake(403, 2), 1);
+        assert_eq!(q.parked_count(), 1);
+        // A stale write's park changes nothing.
+        q.written(3, 404, 404, false);
+        q.park(3, write(3), 900, checked(3 << 16));
+        assert_eq!(q.parked_count(), 1);
+        assert_eq!(q.checked(3, write(3)), None);
+        // Slot 4, parked: a draw that makes its host slot leaves it parked;
+        q.written(4, 404, 404, true);
+        assert_eq!(q.parked_count(), 1);
+        // memory written under it makes it due as one written now;
+        q.changed(4, 405, 406);
+        assert_eq!(q.parked_count(), 0);
+        assert!(q.due(406, 10).iter().any(|d| d.0 == 4));
+        assert_eq!(q.wake(u64::MAX, 10), 0);
+        // and parked again, a table's read takes it out of the queue.
+        let w4 = q.due(406, 10).into_iter().find(|d| d.0 == 4).unwrap().1;
+        q.park(4, w4, 900, checked(4 << 16));
+        assert_eq!(q.parked_count(), 1);
+        assert!(q.take_out(4));
+        assert!(!q.take_out(4));
+        assert_eq!((q.parked_count(), q.wake(u64::MAX, 10)), (0, 0));
+        // A descriptor rewrite of a parked slot is a new write in the queue.
+        let w1 = q.due(403, 10).into_iter().find(|d| d.0 == 1).unwrap().1;
+        q.park(1, w1, 900, checked(1 << 16));
+        q.written(1, 500, 500, false);
+        assert_eq!(q.parked_count(), 0);
+        let (index, new) = q.due(500, 10).into_iter().find(|d| d.0 == 1).unwrap();
+        assert_ne!((index, new), (1, w1));
+        assert_eq!(q.checked(1, new), None);
     }
 
     /// Slots held back for lack of room on the card are not handed out

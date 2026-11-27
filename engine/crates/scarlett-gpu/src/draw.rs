@@ -832,18 +832,94 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
-fn next_texture_recheck(unchanged_looks: u8, changed_in_place: bool) -> Option<(u8, u64)> {
+/// The look after `unchanged_looks` looks in a row that found nothing
+/// changed: how many that makes and the frames until it, or none if the
+/// looks end. `keep`: they never end, the last wait over and over.
+fn next_texture_recheck(unchanged_looks: u8, keep: bool) -> Option<(u8, u64)> {
     let next = usize::from(unchanged_looks) + 1;
     if let Some(&wait) = RECHECK_FRAMES.get(next) {
         Some((next as u8, wait))
     } else {
-        changed_in_place.then_some((unchanged_looks, RECHECK_FRAMES[RECHECK_FRAMES.len() - 1]))
+        keep.then_some((unchanged_looks, RECHECK_FRAMES[RECHECK_FRAMES.len() - 1]))
     }
+}
+
+/// What follows a look at a texture picked by index that found its memory
+/// as it was at the upload ([`after_unchanged_look`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterLook {
+    /// Looked at again after the frames given, having had that many looks.
+    Again(u8, u64),
+    /// The same, the longest wait off: the slot is parked until then
+    /// (`crate::descriptor::host::TextureQueue::park`).
+    Park(u8, u64),
+    /// No more looks: out of the queue until something tells of it.
+    Done,
+}
+
+/// After `unchanged_looks` looks in a row found nothing changed: the looks
+/// go on for ever for a texture once found changed with nothing to tell of
+/// it (`changed_in_place`), and for one whose memory the title shows at
+/// other addresses too (`shown_elsewhere`, asked only when the looks would
+/// end; `SCARLETT_ALIASED_RECHECK=0`: not asked, they end as before).
+///
+/// What is written through another view of a texture's pages is told at
+/// that address, if at all, and the texture's upload keeps what its memory
+/// held before. Of some 480,000 such textures found changed by these looks
+/// in run scar13 every one had blocks shown elsewhere, some found
+/// 100,000 frames after their upload: those whose looks had ended (after
+/// some 576 frames) were never found, and kept what their memory held at the
+/// upload (zeros, black, for one filled after it) until their view was
+/// written again.
+fn after_unchanged_look(unchanged_looks: u8, changed_in_place: bool, shown_elsewhere: impl FnOnce() -> bool) -> AfterLook {
+    let last = usize::from(unchanged_looks) + 1 >= RECHECK_FRAMES.len();
+    let keep = changed_in_place || (last && aliased_recheck() && shown_elsewhere());
+    match next_texture_recheck(unchanged_looks, keep) {
+        Some((looks, wait)) if wait >= RECHECK_FRAMES[RECHECK_FRAMES.len() - 1] => AfterLook::Park(looks, wait),
+        Some((looks, wait)) => AfterLook::Again(looks, wait),
+        None => AfterLook::Done,
+    }
+}
+
+/// Whether textures in memory the title shows at other addresses too are
+/// looked at for as long as they stay ([`after_unchanged_look`];
+/// `SCARLETT_ALIASED_RECHECK=0`: their looks end as any other's).
+fn aliased_recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SCARLETT_ALIASED_RECHECK").is_none_or(|v| v != "0"))
 }
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Since the start: of the looks that found a texture changed
+/// ([`HEAP_TEXTURES_RECHECKED`]), those whose memory the title shows at other
+/// addresses too; and looks that would have been the last but go on because
+/// of that ([`after_unchanged_look`]).
+pub(crate) static HEAP_TEXTURES_ALIASED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// The line of what the looks at textures picked by index found, every ten
+/// seconds while they run.
+fn say_rechecks(host: &crate::descriptor::host::HostHeap) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let [same, changed] = [0, 1].map(|i| HEAP_TEXTURES_RECHECKED[i].load(Ordering::Relaxed));
+    let [aliased, kept] = [0, 1].map(|i| HEAP_TEXTURES_ALIASED[i].load(Ordering::Relaxed));
+    let [told, bytes] = [0, 1].map(|i| crate::watch::ALIAS_TOLD[i].load(Ordering::Relaxed));
+    tracing::info!(
+        "textures picked by index looked at again, since the start: {same} looks found them as uploaded, {changed} found \
+         them changed with nothing to tell of it ({aliased} of those in memory the title shows at other addresses too), \
+         {kept} last looks went on as their memory is shown elsewhere; {} slots parked until their next look; {told} \
+         writes told at other addresses of their pages too ({} MB) (SCARLETT_ALIAS_NOTICES, SCARLETT_ALIASED_RECHECK)",
+        host.texture_slots_parked(),
+        bytes >> 20
+    );
+}
 
 /// Uploads of textures already on the card made while it had no room for
 /// new ones, since the start.
@@ -2811,7 +2887,9 @@ impl State {
             // first look for the rest of the run. The look reads 48 KiB;
             // only a changed texture is uploaded again.
             // Once a texture has changed without a notice, keep checking
-            // it at the longest interval after the initial checks end.
+            // it at the longest interval after the initial checks end; so
+            // too one whose memory the title shows at other addresses
+            // (`after_unchanged_look`), parked between its looks.
             // `SCARLETT_HEAP_RECHECK=0`: uploaded once, as before.
             // One found changed by such a look is looked at in the next frame
             // again: the textures left that change unnoticed are ones the
@@ -2826,18 +2904,35 @@ impl State {
                 let looked = timed(0, || crate::texture::fingerprint(at, len));
                 if looked == fingerprint {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match next_texture_recheck(unchanged_looks, checked.changed_in_place) {
-                        Some((looks, wait)) => {
+                    // Looked at for as long as it stays if its memory is
+                    // shown at other addresses too (`after_unchanged_look`);
+                    // a long wait parked, out of the walk of every pass.
+                    let shown_elsewhere = || {
+                        let shown = crate::inplace::any_shown_elsewhere(at as usize, at.saturating_add(len) as usize);
+                        if shown {
+                            HEAP_TEXTURES_ALIASED[1].fetch_add(1, Ordering::Relaxed);
+                        }
+                        shown
+                    };
+                    match after_unchanged_look(unchanged_looks, checked.changed_in_place, shown_elsewhere) {
+                        AfterLook::Again(looks, wait) => {
                             checked.unchanged_looks = looks;
                             host.texture_slot_recheck(index, write, frame + wait, checked);
                         }
-                        None => host.texture_slot_done(index, write, None),
+                        AfterLook::Park(looks, wait) => {
+                            checked.unchanged_looks = looks;
+                            host.texture_slot_park(index, write, frame + wait, checked);
+                        }
+                        AfterLook::Done => host.texture_slot_done(index, write, None),
                     }
                     continue;
                 }
                 changed_in_place = true;
                 if recheck_soon() {
                     again_in = 1;
+                }
+                if crate::inplace::any_shown_elsewhere(at as usize, at.saturating_add(len) as usize) {
+                    HEAP_TEXTURES_ALIASED[0].fetch_add(1, Ordering::Relaxed);
                 }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
@@ -3187,6 +3282,7 @@ impl State {
             BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
         }
         HEAP_TEXTURE_MICROS[4].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        say_rechecks(host);
         served
     }
 
@@ -5413,7 +5509,36 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_texture_recheck, staging_budget_per_frame};
+    use super::{AfterLook, after_unchanged_look, next_texture_recheck, staging_budget_per_frame};
+
+    /// A texture whose memory is shown at other addresses too is looked at
+    /// for as long as it stays, parked between its looks at the longest wait;
+    /// whether it is shown elsewhere is asked only when its looks would end.
+    #[test]
+    fn textures_shown_elsewhere_are_looked_at_for_as_long_as_they_stay() {
+        let asked = std::cell::Cell::new(0);
+        let shown = |answer: bool| {
+            let asked = &asked;
+            move || {
+                asked.set(asked.get() + 1);
+                answer
+            }
+        };
+        // The first looks: as before, the last wait parked, nothing asked.
+        for answer in [false, true] {
+            assert_eq!(after_unchanged_look(0, false, shown(answer)), AfterLook::Again(1, 12));
+            assert_eq!(after_unchanged_look(2, false, shown(answer)), AfterLook::Again(3, 120));
+            assert_eq!(after_unchanged_look(3, false, shown(answer)), AfterLook::Park(4, 400));
+        }
+        assert_eq!(asked.get(), 0);
+        // The last look: done, unless its memory is shown elsewhere.
+        assert_eq!(after_unchanged_look(4, false, shown(false)), AfterLook::Done);
+        assert_eq!(after_unchanged_look(4, false, shown(true)), AfterLook::Park(4, 400));
+        assert_eq!(asked.get(), 2);
+        // Once changed with nothing to tell of it: kept, without asking.
+        assert_eq!(after_unchanged_look(4, true, shown(false)), AfterLook::Park(4, 400));
+        assert_eq!(asked.get(), 2);
+    }
 
     #[test]
     fn only_previously_changed_textures_keep_the_final_recheck_interval() {

@@ -2145,11 +2145,18 @@ impl std::hash::Hasher for PageHash {
 
 /// What shaders wrote is about to go into title memory at `[at, at + len)`.
 pub(crate) fn landing(at: usize, len: usize) {
+    // The same pages at other addresses, looked up once for the notes here
+    // and for the textures there ([`told_elsewhere`]).
+    let others = if (view_guard() || alias_notices()) && len != 0 {
+        crate::inplace::shown_elsewhere(at / BLOCK * BLOCK, at.saturating_add(len))
+    } else {
+        Vec::new()
+    };
     {
         let frame = crate::frame::current();
         let (first, last) = (at / KERNEL_PAGE, (at + len.max(1) - 1) / KERNEL_PAGE);
         (first..=last).for_each(|page| LANDED.note(page, frame));
-        for (block, others) in elsewhere(at, len) {
+        for (block, others) in others.iter().filter(|_| view_guard()) {
             let block = block / KERNEL_PAGE;
             let here = first.max(block)..=last.min(block + BLOCK / KERNEL_PAGE - 1);
             for other in others {
@@ -2157,7 +2164,75 @@ pub(crate) fn landing(at: usize, len: usize) {
             }
         }
     }
-    writing(at, len);
+    writing_seen(at, len, Some(&others));
+}
+
+/// Whether a write we are told of at one address ([`writing`],
+/// [`kernel_writing`], [`landing`]) is told to the textures picked by index
+/// at every other address of its pages too (`SCARLETT_ALIAS_NOTICES=0`: at
+/// that address alone, as before).
+///
+/// The title shows one physical page at several addresses. A texture placed
+/// at one of them was uploaded with what its memory held then, and a write
+/// told at another address alone left it so: the pass found such textures
+/// changed only by its looks at their memory, some 480,000 times in run
+/// scar13 (every one with blocks shown elsewhere), and a texture whose looks
+/// had ended stayed as uploaded (black, for one filled after it).
+fn alias_notices() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SCARLETT_ALIAS_NOTICES").is_none_or(|v| v != "0"))
+}
+
+/// The most bytes of a write told at other addresses ([`told_elsewhere`]):
+/// a title's `fread` with a huge count is told up to the end of the address
+/// space, and every view above it would be looked up.
+const ALIAS_MOST: usize = 64 << 20;
+
+/// Since the start: ranges told at other addresses of their pages
+/// ([`told_elsewhere`]), and their bytes.
+pub(crate) static ALIAS_TOLD: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Where else the bytes `[at, at + len)` are shown, as `(address, bytes)`:
+/// for each 64 KiB block of `elsewhere` ([`crate::inplace::shown_elsewhere`]
+/// of the range), the part of the range in it, at each other address of
+/// that block.
+pub(crate) fn other_views(at: usize, len: usize, elsewhere: &[(usize, Vec<usize>)]) -> Vec<(usize, usize)> {
+    let end = at.saturating_add(len);
+    let mut out = Vec::new();
+    for (block, others) in elsewhere {
+        let (from, to) = (at.max(*block), end.min(block.saturating_add(BLOCK)));
+        if from >= to {
+            continue;
+        }
+        out.extend(others.iter().map(|&other| (other + (from - block), to - from)));
+    }
+    out
+}
+
+/// A write of `[at, at + len)` that the texture pass is told of at this
+/// address ([`crate::descriptor::host::remapped`]) is told at the other
+/// addresses of its pages as well ([`alias_notices`]); `known`: those, if
+/// the caller looked them up. Takes the views' lock shared (a leaf: nothing
+/// is called under it), then the lock of the ranges kept for the pass.
+fn told_elsewhere(at: usize, len: usize, known: Option<&[(usize, Vec<usize>)]>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if len == 0 || !alias_notices() {
+        return;
+    }
+    let len = len.min(ALIAS_MOST);
+    let found;
+    let elsewhere = match known {
+        Some(known) => known,
+        None => {
+            found = crate::inplace::shown_elsewhere(at / BLOCK * BLOCK, at.saturating_add(len));
+            &found
+        }
+    };
+    for (other, bytes) in other_views(at, len, elsewhere) {
+        ALIAS_TOLD[0].fetch_add(1, Relaxed);
+        ALIAS_TOLD[1].fetch_add(bytes as u64, Relaxed);
+        crate::descriptor::host::remapped(other, bytes);
+    }
 }
 
 
@@ -2821,6 +2896,12 @@ fn unguard(g: &Guards, blocks: &[usize]) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    writing_seen(at, len, None);
+}
+
+/// [`writing`]; `elsewhere`: the other addresses of the pages, if the
+/// caller looked them up ([`told_elsewhere`]).
+fn writing_seen(at: usize, len: usize, elsewhere: Option<&[(usize, Vec<usize>)]>) {
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
@@ -2833,8 +2914,10 @@ pub fn writing(at: usize, len: usize) {
         }
         let _ = opened;
     }
-    // A placed texture there changes with no descriptor written.
+    // A placed texture there changes with no descriptor written, and one at
+    // another address of the same pages.
     crate::descriptor::host::remapped(at, len);
+    told_elsewhere(at, len, elsewhere);
 }
 
 /// The kernel writes title memory `[at, at + len)` until what this returns
@@ -2867,6 +2950,7 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
         }
     }
     crate::descriptor::host::remapped(at, len);
+    told_elsewhere(at, len, None);
     KernelWrite(first, if len == 0 { first } else { last })
 }
 
@@ -5032,6 +5116,41 @@ mod tests {
         assert!(told.iter().any(|w| w.0 == two / PAGE && w.1 > before), "{told:?} after {before}");
         assert!(landed_lately(two + 3 * 4096, 16, 1) && !landed_lately(two + 4 * 4096, 16, 1));
         drop_views(section, &[one, two], BLOCK);
+    }
+
+    /// A write told at one view of pages is told at every other view of
+    /// them, block by block and at the same offset in each, for the
+    /// textures picked by index there; pages shown once are told nowhere
+    /// else. (The runtime's books alone: addresses and sections nothing
+    /// maps, the sections odd numbers no handle has.)
+    #[test]
+    fn a_write_told_at_one_view_is_told_at_the_others() {
+        use crate::inplace::{any_shown_elsewhere, shown_elsewhere, title_memory_view, views_gone};
+        let (one, two, alone) = (0x7_6000_0000usize, 0x7_6800_0000usize, 0x7_7000_0000usize);
+        let section = 0x6a11;
+        // The first view shows the section's blocks 0-2, the second its
+        // blocks 1-2; another section's block is shown once.
+        title_memory_view(one, 3 * BLOCK, section, 0);
+        title_memory_view(two, 2 * BLOCK, section, BLOCK as u64);
+        title_memory_view(alone, BLOCK, section + 2, 0);
+        let told = |at: usize, len: usize| other_views(at, len, &shown_elsewhere(at / BLOCK * BLOCK, at + len));
+        // Across the first view's second and third blocks: the same bytes
+        // at the second view.
+        assert_eq!(told(one + BLOCK + 100, BLOCK), [(two + 100, BLOCK - 100), (two + BLOCK, 100)]);
+        assert_eq!(told(two + 8, 16), [(one + BLOCK + 8, 16)]);
+        // The first view's first block, and the other section, are shown
+        // nowhere else.
+        assert_eq!(told(one, 50), [] as [(usize, usize); 0]);
+        assert_eq!(told(alone, BLOCK), [] as [(usize, usize); 0]);
+        assert!(any_shown_elsewhere(one + 5, one + 2 * BLOCK) && !any_shown_elsewhere(one + 5, one + BLOCK));
+        assert!(!any_shown_elsewhere(alone, alone + BLOCK));
+        // Told at the first view of none of it, past the end of the space:
+        // nothing.
+        assert_eq!(other_views(usize::MAX - 16, PAGE, &[]), [] as [(usize, usize); 0]);
+        for (at, len) in [(one, 3 * BLOCK), (two, 2 * BLOCK), (alone, BLOCK)] {
+            views_gone(at, len);
+        }
+        assert!(!any_shown_elsewhere(one, one + 3 * BLOCK));
     }
 
     /// A view is cut in two by the runtime: until that is done, its pages
