@@ -232,13 +232,6 @@ fn parse_jobs(value: &str) -> Result<usize, &'static str> {
 
 fn main() -> Result<()> {
     scarlett_core::env::alias_scarlett();
-    // Local: with both folders set, nothing under %LOCALAPPDATA% is used, so the former
-    // folder (which other VIctory builds on this PC share) is left where it is.
-    if scarlett_core::env::var_os("SCARLETT_DATA_DIR").is_none()
-        || scarlett_core::env::var_os("SCARLETT_CACHE_DIR").is_none()
-    {
-        scarlett_core::config::migrate_legacy_data();
-    }
     scarlett_core::logging::init("info");
     // The audio recorder `run` starts for `SCARLETT_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
