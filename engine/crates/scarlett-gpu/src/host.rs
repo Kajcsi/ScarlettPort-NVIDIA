@@ -3626,7 +3626,6 @@ unsafe fn wait_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, conte
     }
     let status = unsafe { WaitForSingleObject(event, INFINITE) };
     if status != windows::Win32::Foundation::WAIT_OBJECT_0 {
-    crate::port::log(frames);
         fail(format_args!("{context}: fence wait failed: {status:?}"));
     }
     let completed = unsafe { fence.GetCompletedValue() };
@@ -4049,6 +4048,7 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    crate::port::log(frames);
     crate::watch::port_guard_line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
