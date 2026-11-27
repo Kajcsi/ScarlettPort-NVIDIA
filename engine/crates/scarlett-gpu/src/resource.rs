@@ -2158,7 +2158,7 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("SCARLETT_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
-    let (idle_ms, most) = match memory {
+    let (mut idle_ms, mut most) = match memory {
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
@@ -2167,6 +2167,18 @@ pub(crate) fn let_go_idle() {
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
+    // Card memory counts against the commit limit: with too little of it
+    // free, enough of the longest idle go for it to come back (the card's
+    // own budget may still have room: copies are kept ten minutes then).
+    // Under the floor itself the queue is stopped, so sooner.
+    let for_commit = crate::residency::commit_short();
+    if let Some((short, under)) = for_commit {
+        let idle = if under { 1_500 } else { 5_000 };
+        if !(most == u64::MAX && idle_ms <= idle) {
+            idle_ms = idle_ms.min(idle);
+            most = if most == u64::MAX { short } else { most.max(short) };
+        }
+    }
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -2245,6 +2257,9 @@ pub(crate) fn let_go_idle() {
             }
             crate::host::retire(host);
         }
+    }
+    if for_commit.is_some() {
+        crate::residency::let_go_for_commit(bytes);
     }
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);

@@ -130,20 +130,32 @@ pub(crate) fn refresh() {
     }
 }
 
-/// Whether the texture queue may put more on the card: memory on the card
+/// Free commit the card's copies leave, in bytes:
+/// `SCARLETT_CARD_COMMIT_FLOOR_MB` (6,144; 0: none). Memory on the card
 /// counts against Windows' commit limit one for one (measured on an RTX
 /// 4090: 4 GB of buffers in a DEFAULT heap raised the process's and the
 /// system's commit by 4 GB, with no working set). On a PC with a small
 /// paging file the card's copies used the commit up and a later allocation
-/// of 3.6 MB ended the run with 24 GB of RAM still free. The queue stops
-/// while less than `SCARLETT_CARD_COMMIT_FLOOR_MB` (6,144; 0: no floor) of
-/// commit is free; textures already on the card stay.
-pub(crate) fn commit_room_for_card() -> bool {
+/// of 3.6 MB ended the run with 24 GB of RAM still free (scar3).
+fn card_commit_floor() -> u64 {
     static FLOOR: OnceLock<u64> = OnceLock::new();
-    static SAID: AtomicBool = AtomicBool::new(false);
-    let floor = *FLOOR.get_or_init(|| {
+    *FLOOR.get_or_init(|| {
         std::env::var("SCARLETT_CARD_COMMIT_FLOOR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(6144) * MIB
-    });
+    })
+}
+
+/// How far above [`card_commit_floor`] idle card copies of textures are let
+/// go ([`commit_short`]), so the texture queue seldom meets the floor.
+const COMMIT_MARGIN: u64 = 1536 * MIB;
+
+/// Whether the texture queue may put more on the card: not while less than
+/// [`card_commit_floor`] of commit is free. Textures already on the card
+/// stay; [`commit_short`] has idle ones let go to make room again. (A stop
+/// alone, as at first, left the queue stopped for good once the copies kept
+/// for minutes had used the commit: houses without their textures, scar5.)
+pub(crate) fn commit_room_for_card() -> bool {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    let floor = card_commit_floor();
     if floor == 0 {
         return true;
     }
@@ -153,10 +165,46 @@ pub(crate) fn commit_room_for_card() -> bool {
         tracing::warn!(
             available_commit_mib = commit >> 20,
             floor_mib = floor >> 20,
-            "commit low: no more texture copies on the card until it is free again (SCARLETT_CARD_COMMIT_FLOOR_MB)"
+            "commit low: no new texture copies on the card until idle ones are let go (SCARLETT_CARD_COMMIT_FLOOR_MB)"
         );
     }
     room
+}
+
+/// When the next commit-driven let-go may run: what was let go returns to
+/// Windows only once the submissions that may use it have finished and its
+/// pool block is empty and trimmed (`crate::pool::room`, once a second).
+static NEXT_COMMIT_LET_GO: AtomicU64 = AtomicU64::new(0);
+
+/// The bytes of idle card copies to let go for free commit to come back to
+/// [`card_commit_floor`] and [`COMMIT_MARGIN`] above it, and whether it is
+/// under the floor itself (the queue stopped): none with no floor, with
+/// enough free, or within three seconds of the last such let-go
+/// ([`let_go_for_commit`]).
+pub(crate) fn commit_short() -> Option<(u64, bool)> {
+    let floor = card_commit_floor();
+    if floor == 0 {
+        return None;
+    }
+    let now = crate::host::coarse_ms();
+    if now < NEXT_COMMIT_LET_GO.load(Ordering::Relaxed) {
+        return None;
+    }
+    let commit = sample_commit(now);
+    let target = floor + COMMIT_MARGIN;
+    (commit < target).then(|| (target - commit, commit < floor))
+}
+
+/// Says that `bytes` of card copies were let go for commit.
+pub(crate) fn let_go_for_commit(bytes: u64) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    NEXT_COMMIT_LET_GO.store(crate::host::coarse_ms().saturating_add(3000), Ordering::Relaxed);
+    if bytes != 0 && !SAID.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            let_go_mib = bytes >> 20,
+            "commit low: idle texture copies on the card let go to make room (logged once)"
+        );
+    }
 }
 
 pub(crate) fn headroom() -> Option<u64> {

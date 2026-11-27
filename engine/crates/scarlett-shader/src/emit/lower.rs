@@ -1008,6 +1008,137 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     Some(meet)
 }
 
+/// The start an LDS dword needs for the atomic `name` to fold values into it: `u32::MAX` for a
+/// minimum or an AND, 0 for a maximum, sum, OR or XOR, ... `None`: not such a fold.
+fn fold_identity(name: &str) -> Option<u32> {
+    Some(match name.replace("_rtn", "").as_str() {
+        "ds_min_u32" | "ds_and_b32" => u32::MAX,
+        "ds_max_u32" | "ds_add_u32" | "ds_or_b32" | "ds_xor_b32" => 0,
+        "ds_min_i32" => 0x7FFF_FFFF,
+        "ds_max_i32" => 0x8000_0000,
+        _ => return None,
+    })
+}
+
+/// The LDS dwords of a compute program (below `dwords`, its own) that hold a fold's start,
+/// with that start: every write to the dword is a `ds_write_b32` or `ds_write2_b32` of one
+/// constant at a constant address, and that constant is the start of every atomic on it (at
+/// least one atomic). Empty if any LDS write or atomic has an address, or a write data, that
+/// is not a constant of its block: what it may touch is not known.
+///
+/// The title's water tile programs (`CS_TransmissionVolumetrics_Tiled` and its local-lights
+/// twin) do this: after per-pixel early exits the tile's corner thread alone stores the
+/// tile's start maximum and minimum, then every thread folds its own value in and reads both
+/// back. When the corner pixel has exited (not water: along shores, around boats, under
+/// bridges) the start is never stored and the folds start from what the LDS held before. On
+/// the console that is the previous tile's result, close enough; on the host it is anything,
+/// and the tile's light comes out dark: the blocks on open water (scar5; the same programs
+/// and diagnosis as fxceless/victory-fork a9181638, whose analysis this follows).
+///
+/// Stored by every thread first thing, behind a group barrier, the dwords start right
+/// whether or not the corner thread gets there. Exact: where the program's own store runs it
+/// stores the same value again, and a fold that would have met no store of this group read
+/// memory this group never wrote.
+fn lds_fold_starts(p: &Program, dwords: u32) -> Vec<(u32, u32)> {
+    // `x` at `insts[i]`: set by a plain `v_mov_b32` of a constant earlier in the block, with
+    // EXEC unchanged since (so in every lane that runs `i`)
+    let constant = |insts: &[Inst], i: usize, x: Value| -> Option<u32> {
+        let d = insts[..i].iter().rposition(|j| j.writes.iter().any(|w| w.1 == x))?;
+        let Fields::Valu(f) = &insts[d].fields else {
+            return None;
+        };
+        let exec_kept = insts[d + 1..i]
+            .iter()
+            .all(|j| j.write(Reg::S(EXEC)).is_none() && j.write(Reg::S(EXEC + 1)).is_none());
+        let plain = insts[d].name() == "v_mov_b32"
+            && f.abs == 0
+            && f.neg == 0
+            && !f.clamp
+            && f.omod == 0
+            && f.opsel == 0
+            && f.sdwa.is_none()
+            && f.dpp.is_none();
+        if !(plain && exec_kept) {
+            return None;
+        }
+        match f.src.first()? {
+            Operand::Const(c) => crate::resource::inline(*c),
+            Operand::Literal(k) => Some(*k),
+            _ => None,
+        }
+    };
+    let vector = |insts: &[Inst], i: usize, o: Option<&Operand>| -> Option<u32> {
+        let &Operand::Vector { reg, .. } = o? else {
+            return None;
+        };
+        constant(insts, i, insts[i].read(Reg::V(reg))?)
+    };
+    let mut stores: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut folds: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for block in &p.blocks {
+        let insts = &block.insts;
+        for (i, inst) in insts.iter().enumerate() {
+            let Fields::Ds {
+                addr,
+                data,
+                offset0,
+                offset1,
+                gds,
+                ..
+            } = &inst.fields
+            else {
+                continue;
+            };
+            let name = inst.name();
+            // what does not touch this group's LDS: lane exchanges, GDS, reads
+            if *gds
+                || name.starts_with("ds_read")
+                || name.starts_with("ds_swizzle")
+                || name.contains("permute")
+                || name.starts_with("ds_gws")
+                || name.starts_with("ds_ordered")
+                || name == "ds_nop"
+            {
+                continue;
+            }
+            let Some(base) = vector(insts, i, addr.as_ref()) else {
+                return Vec::new();
+            };
+            let single = u32::from(*offset0) | u32::from(*offset1) << 8;
+            let dword = |bytes: u32| base.wrapping_add(bytes) / 4;
+            match name {
+                "ds_write_b32" | "ds_write2_b32" => {
+                    let at: Vec<u32> = if name == "ds_write_b32" {
+                        vec![single]
+                    } else {
+                        vec![u32::from(*offset0) * 4, u32::from(*offset1) * 4]
+                    };
+                    for (n, bytes) in at.into_iter().enumerate() {
+                        let Some(k) = vector(insts, i, data.get(n)) else {
+                            return Vec::new();
+                        };
+                        stores.entry(dword(bytes)).or_default().push(k);
+                    }
+                }
+                _ => {
+                    let Some(start) = fold_identity(name) else {
+                        return Vec::new();
+                    };
+                    folds.entry(dword(single)).or_default().push(start);
+                }
+            }
+        }
+    }
+    stores
+        .into_iter()
+        .filter_map(|(dword, values)| {
+            let k = values[0];
+            let starts = folds.get(&dword)?;
+            (dword < dwords && values.iter().all(|&v| v == k) && starts.iter().all(|&v| v == k)).then_some((dword, k))
+        })
+        .collect()
+}
+
 /// Masks held as numbers or constant lane sets in guards or lane branches: the lane tests its
 /// own bit by its console lane.
 fn lane_constant_masks(st: &Structured) -> bool {
@@ -2449,6 +2580,7 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
+        self.store_fold_starts();
         self.find_sections();
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
@@ -4219,6 +4351,31 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::WAVE_OPS;
         self.clane = Some(cl);
         cl
+    }
+
+    /// The LDS dwords a compute program folds into from a start one thread stores
+    /// ([`lds_fold_starts`]): stored with that start by every thread first thing, then a group
+    /// barrier (every thread is still here, before any other LDS access).
+    /// `SCARLETT_LDS_FOLD_STARTS=0`: not ([`super::lds_fold_starts_on`]).
+    fn store_fold_starts(&mut self) {
+        let StageIo::Cs(cs) = self.x.native.io else {
+            return;
+        };
+        if self.s.mesh.is_some() || !super::lds_fold_starts_on() {
+            return;
+        }
+        let starts = lds_fold_starts(self.x.p, cs.lds_bytes() / 4);
+        if starts.is_empty() {
+            return;
+        }
+        let e = self.s.entry;
+        let lds = self.s.lds();
+        for (dword, value) in starts {
+            let (at, k) = (self.s.m.i32(dword), self.s.m.i32(value));
+            let ptr = self.s.m.element(e, lds, at);
+            self.s.m.store(e, ptr, k);
+        }
+        self.group_sync(e);
     }
 
     /// A group barrier with an LDS fence in `block`.
