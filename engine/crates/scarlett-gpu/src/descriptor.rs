@@ -952,6 +952,16 @@ impl View {
 /// without the address: as many as the title has kinds of textures and
 /// buffers, however often it moves them).
 /// `SCARLETT_VIEW_INLINE=0`: every view is an entry, as before.
+///
+/// Bounded since scar13: the title also makes buffer views of placed memory
+/// whose descriptions differ in more than the address (scar12 ran out of
+/// memory after about 1.5 hours with all 4,194,304 shapes taken and 16.7
+/// million entries behind them, some 5 GB). Shapes stop at [`SHAPES_KEPT`];
+/// the views past them, and constant buffer views that do not fit a record,
+/// are entries of a ring of [`ENTRIES_KEPT`] that a clock recycles: an entry
+/// not named since the clock last passed it is given to the next new view
+/// under a new generation, so a record still naming the old view reads as
+/// no view (null), never as another one.
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
@@ -962,6 +972,22 @@ struct Views {
     /// The shapes of views of placed memory, and where each is.
     shapes: Vec<Shape>,
     shape_index: std::collections::BTreeMap<Shape, u32>,
+    /// Whether each entry was named since the clock last passed it.
+    seen: Vec<std::sync::atomic::AtomicBool>,
+    /// The entries of views without a resource object, in the order the
+    /// clock passes them, and where it is.
+    ring: Vec<u32>,
+    hand: usize,
+    /// How many shapes and ring entries there may be.
+    shapes_kept: usize,
+    entries_kept: usize,
+    /// Ring entries given to another view so far.
+    recycled: u64,
+    /// For the log: the last new shape, and how often each of its words
+    /// (resource description 0..14, then the view's but the address)
+    /// differed from the one before.
+    last: Option<Shape>,
+    differed: [u32; 28],
 }
 
 /// Read far more often than written: every slot a draw reads through a
@@ -975,6 +1001,14 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     free: Vec::new(),
     shapes: Vec::new(),
     shape_index: std::collections::BTreeMap::new(),
+    seen: Vec::new(),
+    ring: Vec::new(),
+    hand: 0,
+    shapes_kept: SHAPES_KEPT,
+    entries_kept: ENTRIES_KEPT,
+    recycled: 0,
+    last: None,
+    differed: [0; 28],
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
@@ -995,6 +1029,12 @@ const CONSTANT_ADDRESS_BITS: u32 = 47;
 /// memory, which lies below 1 TiB. The 22 bits above them number its shape.
 const PLACED_ADDRESS_BITS: u32 = 40;
 const SHAPES: usize = 1 << (62 - PLACED_ADDRESS_BITS);
+/// Shapes kept at most (each costs some 270 bytes with its index): far more
+/// than the title has kinds of textures and buffers.
+const SHAPES_KEPT: usize = 1 << 19;
+/// Entries of views without a resource object kept at most (some 330 bytes
+/// each with the index); older ones unnamed since are recycled.
+const ENTRIES_KEPT: usize = 1 << 18;
 
 /// A view of placed memory without its address: whether it is unordered
 /// access, the resource description, and the view's words but the two that
@@ -1074,13 +1114,47 @@ impl Views {
         if let Some(&at) = self.shape_index.get(&shape) {
             return Some(at);
         }
-        if self.shapes.len() >= SHAPES {
+        if self.shapes.len() >= self.shapes_kept.min(SHAPES) {
             return None;
         }
+        self.note_shape(&shape);
         let at = self.shapes.len() as u32;
         self.shapes.push(shape);
         self.shape_index.insert(shape, at);
         Some(at)
+    }
+
+    /// Counts the words of a new shape that differ from the last new one,
+    /// and logs the counts at every power of two of shapes from 16,384 and
+    /// when they are full: which words make the title's views new shapes.
+    fn note_shape(&mut self, shape: &Shape) {
+        if let Some(last) = &self.last {
+            let words = last.1.iter().chain(&last.2).zip(shape.1.iter().chain(&shape.2));
+            for (count, (a, b)) in self.differed.iter_mut().zip(words) {
+                *count += u32::from(a != b);
+            }
+        }
+        self.last = Some(*shape);
+        let n = self.shapes.len() + 1;
+        let most = self.shapes_kept.min(SHAPES);
+        if (n >= 1 << 14 && n.is_power_of_two()) || n == most {
+            // The view's words are 0..10 and 12..16 (10 and 11: the address).
+            let words: Vec<String> = self
+                .differed
+                .iter()
+                .enumerate()
+                .filter(|&(_, &c)| c > 0)
+                .map(|(k, c)| match k {
+                    0..14 => format!("resource {k}: {c}"),
+                    14..24 => format!("view {}: {c}", k - 14),
+                    _ => format!("view {}: {c}", k - 12),
+                })
+                .collect();
+            tracing::info!(
+                "placed view shapes: {n} of {most} kept; words of each new shape that differed from the one before, how often: {}",
+                words.join(", ")
+            );
+        }
     }
 
     /// The view of placed memory [`placed_words`] named.
@@ -1098,7 +1172,49 @@ impl Views {
     /// The record words of `view` as a table entry, if it has one.
     fn entry_of(&self, view: &View) -> Option<[u32; 2]> {
         let &i = self.index.get(view)?;
+        self.saw(i);
         Some([i, self.list[i as usize].1])
+    }
+
+    /// Entry `i` was named: the clock passes it once more.
+    fn saw(&self, i: u32) {
+        if let Some(seen) = self.seen.get(i as usize) {
+            seen.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// An entry for a new view without a resource object once the ring is
+    /// full: the first the clock finds unnamed since it last passed it, under
+    /// a new generation. `None` while the ring has room.
+    fn recycle(&mut self, view: &View) -> Option<u32> {
+        if !matches!(view, View::Placed(..) | View::Constant(..)) || self.ring.len() < self.entries_kept {
+            return None;
+        }
+        // Each pass clears what it finds named, so two passes find one.
+        for _ in 0..2 * self.ring.len() {
+            let i = self.ring[self.hand];
+            self.hand = (self.hand + 1) % self.ring.len();
+            if self.seen[i as usize].swap(false, std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+            let (old, generation) = std::mem::replace(&mut self.list[i as usize], (view.clone(), 0));
+            if self.index.get(&old) == Some(&i) {
+                self.index.remove(&old);
+            }
+            // (Below the bits that say a record is no table entry.)
+            self.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+            self.recycled += 1;
+            if self.recycled == 1 || (self.recycled >= 1 << 16 && self.recycled.is_power_of_two()) {
+                tracing::info!(
+                    "view table: {} entries of views without a resource object recycled so far (ring of {}, {} shapes)",
+                    self.recycled,
+                    self.ring.len(),
+                    self.shapes.len()
+                );
+            }
+            return Some(i);
+        }
+        None
     }
 
     /// The record words of `view` as a table entry: its entry (a new or a
@@ -1107,15 +1223,24 @@ impl Views {
         let i = match self.index.get(&view) {
             Some(&i) => i,
             None => {
-                let i = match self.free.pop() {
-                    Some(i) => {
-                        self.list[i as usize].0 = view.clone();
-                        i
+                let i = if let Some(i) = self.recycle(&view) {
+                    i
+                } else {
+                    let i = match self.free.pop() {
+                        Some(i) => {
+                            self.list[i as usize].0 = view.clone();
+                            i
+                        }
+                        None => {
+                            self.list.push((view.clone(), 1));
+                            self.seen.push(std::sync::atomic::AtomicBool::new(false));
+                            self.list.len() as u32 - 1
+                        }
+                    };
+                    if matches!(view, View::Placed(..) | View::Constant(..)) {
+                        self.ring.push(i);
                     }
-                    None => {
-                        self.list.push((view.clone(), 1));
-                        self.list.len() as u32 - 1
-                    }
+                    i
                 };
                 for r in view.resources().into_iter().filter(|&r| r != 0) {
                     self.by_resource.entry(r).or_default().push(i);
@@ -1124,6 +1249,7 @@ impl Views {
                 i
             }
         };
+        self.saw(i);
         [i, self.list[i as usize].1]
     }
 }
@@ -1366,7 +1492,10 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
         0 => {
             let views = views_read();
             let (view, current) = views.list.get(i as usize)?;
-            (*current == generation).then(|| view.clone())
+            (*current == generation).then(|| {
+                views.saw(i);
+                view.clone()
+            })
         }
         CONSTANT => Some(constant_of(i, generation)),
         PLACED => views_read().placed_of(i, generation),
@@ -1840,6 +1969,69 @@ mod tests {
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1000, 512));
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1100, 256));
         assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
+    }
+
+    /// scar12's out-of-memory crash: placed views whose descriptions keep
+    /// changing took every shape, and the entries behind them grew without
+    /// end. Past the caps an entry named since the clock last passed it
+    /// keeps its view; another is given to the new view under a new
+    /// generation, so its old record names no view.
+    #[test]
+    fn views_past_the_caps_are_recycled() {
+        let mut views = Views {
+            list: Vec::new(),
+            index: std::collections::BTreeMap::new(),
+            by_resource: std::collections::BTreeMap::new(),
+            free: Vec::new(),
+            shapes: Vec::new(),
+            shape_index: std::collections::BTreeMap::new(),
+            seen: Vec::new(),
+            ring: Vec::new(),
+            hand: 0,
+            shapes_kept: 4,
+            entries_kept: 8,
+            recycled: 0,
+            last: None,
+            differed: [0; 28],
+        };
+        // Buffer views of placed memory with ever other element counts.
+        let placed = |n: u32| {
+            let mut desc = [0u32; 16];
+            (desc[1], desc[6], desc[10]) = (1, n, 0x1000);
+            (false, [1; 14], desc)
+        };
+        for n in 0..4 {
+            let (unordered, resource, desc) = placed(n);
+            assert_eq!(views.shape(shape_of(unordered, &resource, &desc).0), Some(n));
+        }
+        let (unordered, resource, desc) = placed(4);
+        assert_eq!(views.shape(shape_of(unordered, &resource, &desc).0), None, "shapes full");
+        assert_eq!(views.differed[14 + 6], 3, "the element count differed each time");
+        let view = |n: u32| {
+            let (unordered, resource, desc) = placed(n);
+            View::Placed(unordered, resource, desc)
+        };
+        let words: Vec<[u32; 2]> = (10..18).map(|n| views.entry(view(n))).collect();
+        assert_eq!(views.list.len(), 8);
+        // The ring is full: every entry was named once, so the clock passes
+        // them all and takes the first.
+        let new = views.entry(view(18));
+        assert_eq!(views.list.len(), 8, "no new entry");
+        assert_eq!(new[0], words[0][0]);
+        assert_ne!(new[1], words[0][1], "a new generation");
+        assert_eq!(views.entry_of(&view(10)), None);
+        assert_eq!(views.list[words[0][0] as usize].0, view(18));
+        // Named again since: kept; the next one goes.
+        assert_eq!(views.entry_of(&view(11)), Some(words[1]));
+        let new = views.entry(view(19));
+        assert_eq!(new[0], words[2][0]);
+        assert_eq!(views.entry_of(&view(11)), Some(words[1]));
+        assert_eq!(views.entry_of(&view(12)), None);
+        assert_eq!(views.recycled, 2);
+        // Views of resource objects are freed with the resource, not here.
+        views.entry(View::Shader(0x1234, None));
+        assert_eq!(views.list.len(), 9);
+        assert_eq!(views.ring.len(), 8);
     }
 
     /// The leak of run 65: a title that writes constant buffer views and
