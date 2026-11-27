@@ -306,7 +306,12 @@ pub(crate) fn early(p: &Arc<Pending>) {
     if p.skipped() {
         return;
     }
-    if !p.shaders.is_empty() && (p.scene_input || super::library::wanted_early(&p.key)) {
+    // Every compute pipeline too (VI-BR-PORT b9d4f96c): the world's first
+    // frame dispatches hundreds of new ones, which on NVIDIA took the driver
+    // up to 6 s each; started here they are made on the workers while the
+    // title still loads.
+    let compute = p.graphics.is_none() && p.shaders.iter().all(|s| s.stage == "compute");
+    if !p.shaders.is_empty() && (p.scene_input || compute || super::library::wanted_early(&p.key)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, if p.scene_input { REQUESTED } else { EARLY });
     }
