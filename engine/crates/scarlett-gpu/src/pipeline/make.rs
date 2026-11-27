@@ -70,7 +70,27 @@ fn required_initialization(shaders: &[Arc<Shader>]) -> bool {
     named(shaders, b"CS_ComputeBlendshapeMappings")
 }
 
+/// The light in the water's volume, in tiles (two compute programs of one 64-lane wave a
+/// group, GTA VI 1.0.2.1), which a host of 32-lane waves runs in the wave-wide form or as
+/// paired code (`SCARLETT_PAIRED_SHADER_DIR`). trustno1-coder/VIctory-NVIDIA 35c15608 found
+/// them leaving whole tiles of open water dark around boats, along shores and under bridges,
+/// at about 15 ms of the card a frame (RTX 5070: 25 fps with them, 30 without, the blocks
+/// gone; the water darker and bluer without that light). Opt-in here
+/// (`SCARLETT_WATER_LIGHT=0` leaves them out): the paired code and the fixes of scar13
+/// (title view slots kept in place, console threads of 2-D groups) come first.
+const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("SCARLETT_WATER_LIGHT").is_some_and(|v| v == "0"))
+        && scarlett_shader::emit::host_settings()[0] == 32
+        && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
+}
+
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if water_light_left_out(shaders) {
+        return Some("the water's tiled light on a host of 32-lane waves, left out (SCARLETT_WATER_LIGHT=0)");
+    }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("SCARLETT_BVH_BUILDER").is_some_and(|v| v == "1");

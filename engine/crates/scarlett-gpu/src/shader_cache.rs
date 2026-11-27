@@ -78,6 +78,7 @@ fn build() -> [u8; 32] {
             // Whether the ray-tracing node test always misses.
             "SCARLETT_RT_MISS",
             "SCARLETT_LDS_FOLD_STARTS",
+            "SCARLETT_THREAD_TICKET",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
