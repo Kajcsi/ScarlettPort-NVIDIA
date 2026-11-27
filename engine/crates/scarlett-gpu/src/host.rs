@@ -32,41 +32,9 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
-/// Host render target and depth view slots ([`Host::rtv`], [`Host::dsv`]).
-/// A view lives only until its command is recorded, and its slot is held
-/// until then ([`HeldView`]); past these, a heap of one view is made for it.
+/// Render target views live only until their command is recorded, so a
+/// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
-
-/// A host render target or depth view whose slot is held until this is
-/// dropped: keep it until the command that names it is recorded.
-///
-/// After RAZDA4A XEN's fork (7e9c3b90, upstream VIctory #2844,
-/// GPL-3.0-or-later): the views were a ring that each thread took the next
-/// slot of, so with many lists recording at once a thread held up between
-/// making its view and recording its command could find the slot made over
-/// by others that had gone round the ring meanwhile, and draw into another
-/// target.
-pub(crate) struct HeldView<'a> {
-    pub(crate) handle: D3D12_CPU_DESCRIPTOR_HANDLE,
-    held: Held<'a>,
-}
-
-enum Held<'a> {
-    /// A slot of the host's heap, back in its free list when dropped.
-    Slot(&'a Mutex<Vec<u32>>, u32),
-    /// A heap of one view made for it (every slot was held).
-    Own(#[allow(dead_code)] ID3D12DescriptorHeap),
-    /// A ring slot not held (no heap of one view could be made).
-    Unheld,
-}
-
-impl Drop for HeldView<'_> {
-    fn drop(&mut self) {
-        if let Held::Slot(free, slot) = self.held {
-            free.lock().unwrap_or_else(|e| e.into_inner()).push(slot);
-        }
-    }
-}
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -81,9 +49,6 @@ pub(crate) struct Host {
     dsvs: ID3D12DescriptorHeap,
     dsv_size: u32,
     next_dsv: AtomicU32,
-    /// The free slots of `dsvs` and `rtvs` ([`HeldView`]).
-    free_dsvs: Mutex<Vec<u32>>,
-    free_rtvs: Mutex<Vec<u32>>,
     /// With `SCARLETT_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
@@ -177,39 +142,14 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// be let go, in milliseconds, and how many bytes of them go at most (the
 /// longest idle first): none but those of ten minutes while what is in use
 /// of the card (`used`: without what our own blocks have free, with what is
-/// kept free for others) is under 75 % of its budget, else enough to come
-/// down to 70 % (the two shares: `SCARLETT_TEXTURE_KEEP_PERCENT`).
-/// `SCARLETT_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
+/// kept free for others) is under 88 % of its budget, else enough to come
+/// down to 85 %. `SCARLETT_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
 /// all that are idle; `=1`: that rule with its two longer times.
 ///
 /// (By those times everything idle for 2.5 s went from 75 % of the budget
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
-    // After voidopcode/vilocity bc5fecf2 (GPL-3.0-or-later):
-    // `SCARLETT_TEXTURE_KEEP_PERCENT=<from>,<down to>` (75,70 unless set; it
-    // was 88,85). At 88 the card ran 2 % under the line at which no new
-    // texture is made (90, `resource::room`), and a scene that loads several
-    // GB of textures in half a minute crossed it: textures then waited (faces
-    // and skin without theirs) while copies whose title memory was long
-    // unmapped stayed. Measured there: with 88,85 the card had no room 321 s
-    // into the opening; with 75,70 never, at the same uploads and frame rate.
-    static PERCENTS: OnceLock<[u64; 2]> = OnceLock::new();
-    let [from, to] = *PERCENTS.get_or_init(|| keep_percents(&std::env::var("SCARLETT_TEXTURE_KEEP_PERCENT").unwrap_or_default()));
-    vram_keep_at(budget, used, from, to)
-}
-
-/// `"88,85"` as the two shares of [`vram_keep`]: between 30 and 95, the second
-/// no more than the first; anything else is 75 and 70.
-fn keep_percents(set: &str) -> [u64; 2] {
-    let mut parts = set.split(',').map(|p| p.trim().parse::<u64>().ok().filter(|v| (30..=95).contains(v)));
-    match (parts.next().flatten(), parts.next().flatten()) {
-        (Some(from), Some(to)) if to <= from => [from, to],
-        _ => [75, 70],
-    }
-}
-
-fn vram_keep_at(budget: u64, used: u64, from: u64, to: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 1_500;
@@ -217,12 +157,12 @@ fn vram_keep_at(budget: u64, used: u64, from: u64, to: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(from) {
+    if used < share(88) {
         (KEPT_MS, u64::MAX)
     } else if used < share(95) {
-        (IDLE_MS, used - share(to))
+        (IDLE_MS, used - share(85))
     } else {
-        (SHORT_MS, used - share(to))
+        (SHORT_MS, used - share(85))
     }
 }
 
@@ -1181,8 +1121,6 @@ fn create() -> windows::core::Result<Host> {
             dsvs,
             dsv_size,
             next_dsv: AtomicU32::new(0),
-            free_dsvs: Mutex::new((0..RTV_RING).rev().collect()),
-            free_rtvs: Mutex::new((0..RTV_RING).rev().collect()),
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
@@ -1807,7 +1745,7 @@ fn record_plane_pass(
                 list.SetGraphicsRootSignature(&root);
                 list.SetPipelineState(&pipeline);
                 list.SetGraphicsRootDescriptorTable(0, gpu);
-                list.OMSetRenderTargets(0, None, false, Some(&target.handle));
+                list.OMSetRenderTargets(0, None, false, Some(&target));
                 list.RSSetViewports(&[D3D12_VIEWPORT {
                     TopLeftX: 0.0,
                     TopLeftY: 0.0,
@@ -2799,9 +2737,9 @@ struct Deferred {
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
+    textures: std::collections::HashSet<usize>,
     /// Last GPU source copied into each aliased host texture in this list.
-    texture_aliases: std::collections::HashMap<usize, usize, std::hash::BuildHasherDefault<AddressHash>>,
+    texture_aliases: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -5432,8 +5370,6 @@ impl Host {
         for (shadow, lo, hi, _) in &pieces {
             traffic::moved(traffic::FETCHED, shadow.span(), std::iter::once((*lo, *hi)));
         }
-        // Shaders wrote these: the copies that only shaders write are found by it.
-        crate::shadow::elide::fetched(pieces.iter().map(|(shadow, lo, hi, _)| (shadow, *lo, *hi)));
         // The sends these flights ran behind, all a fetch on the copy queue
         // is known to have run behind.
         let behind = plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0);
@@ -5788,7 +5724,6 @@ impl Host {
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
         }
         let mut written = vec![0usize; plan.ranges.len()];
-        crate::shadow::elide::fetched(pieces.iter().map(|&(i, lo, hi, _)| (&plan.ranges[i].shadow, lo, hi)));
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
@@ -6924,84 +6859,39 @@ impl Host {
         first_error
     }
 
-    /// A slot for a view of `kind`: a free one of `heap` (held until the
-    /// view is dropped), else a heap of its own, else the next of the ring.
-    fn held_slot<'a>(
-        &'a self,
-        heap: &ID3D12DescriptorHeap,
-        size: u32,
-        free: &'a Mutex<Vec<u32>>,
-        next: &AtomicU32,
-        kind: D3D12_DESCRIPTOR_HEAP_TYPE,
-    ) -> HeldView<'a> {
-        let at = |slot: u32| {
-            // SAFETY: a slot of our heap.
-            let mut handle = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
-            handle.ptr += (slot * size) as usize;
-            handle
-        };
-        if let Some(slot) = free.lock().unwrap_or_else(|e| e.into_inner()).pop() {
-            return HeldView { handle: at(slot), held: Held::Slot(free, slot) };
-        }
-        static SPILLED: AtomicU32 = AtomicU32::new(0);
-        if SPILLED.fetch_add(1, Ordering::Relaxed) == 0 {
-            tracing::info!(?kind, "every held render target or depth view slot is taken: views get heaps of their own (counted once)");
-        }
-        // SAFETY: a plain description of a CPU-only heap.
-        let own: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
-            self.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: kind,
-                NumDescriptors: 1,
-                ..Default::default()
-            })
-        };
-        match own {
-            Ok(own) => {
-                // SAFETY: the heap is kept in the view.
-                let handle = unsafe { own.GetCPUDescriptorHandleForHeapStart() };
-                HeldView { handle, held: Held::Own(own) }
-            }
-            Err(error) => {
-                static FAILED: AtomicU32 = AtomicU32::new(0);
-                if FAILED.fetch_add(1, Ordering::Relaxed) == 0 {
-                    tracing::warn!(?kind, %error, "no heap for a render target or depth view: a ring slot not held (counted once)");
-                }
-                let slot = next.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-                HeldView { handle: at(slot), held: Held::Unheld }
-            }
-        }
-    }
-
-    /// A host render target view of `resource`, held until the returned
-    /// view is dropped: keep it until the command is recorded.
+    /// A host render target view of `resource`, valid until it is recorded.
     pub(crate) fn rtv(
         &self,
         resource: Option<&ID3D12Resource>,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
-    ) -> HeldView<'_> {
-        let view = self.held_slot(&self.rtvs, self.rtv_size, &self.free_rtvs, &self.next_rtv, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        // SAFETY: a held slot and a live resource, or none with a
+    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        // SAFETY: a slot of our heap and a live resource, or none with a
         // description (a typed null view).
         unsafe {
+            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += (slot * self.rtv_size) as usize;
             self.device
-                .CreateRenderTargetView(resource, desc.map(|d| d as *const _), view.handle);
+                .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
+            handle
         }
-        view
     }
 
-    /// A host depth view of `resource`, held as [`Host::rtv`]'s.
+    /// A host depth view of `resource`, valid until it is recorded.
     pub(crate) fn dsv(
         &self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
-    ) -> HeldView<'_> {
-        let view = self.held_slot(&self.dsvs, self.dsv_size, &self.free_dsvs, &self.next_dsv, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        // SAFETY: a held slot and a live resource.
+    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        // SAFETY: a slot of our heap and a live resource.
         unsafe {
+            let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += (slot * self.dsv_size) as usize;
             self.device
-                .CreateDepthStencilView(resource, desc.map(|d| d as *const _), view.handle);
+                .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
+            handle
         }
-        view
     }
 
     /// 1-descriptor shader-visible CBV/SRV/UAV fallback heap for directly-indexed root signatures.
@@ -8357,8 +8247,6 @@ impl HostList {
                     batch.fill();
                     batch.title_written();
                     crate::port::copied(dst, src, len);
-                    // (After maren-halv/VIctory-DXR dd83629.) A step reads title memory: a copy there that is left out of the copy-back is not any more.
-                    crate::shadow::elide::cpu_read(src, len);
                     // Renderer port #7: into a heap's records, the rounds
                     // asked earlier did not see it.
                     if crate::descriptor::in_shader_heap(dst, len) {
@@ -8380,7 +8268,6 @@ impl HostList {
                     {
                         copies += 1;
                     }
-                    crate::shadow::elide::cpu_read(src, len);
                     crate::port::filled(src, len);
                     // What copies at their place wrote there without title
                     // memory taking it ([`place::Known`]).
@@ -8400,7 +8287,6 @@ impl HostList {
                 }
                 Step::Placed(p) => {
                     let started = std::time::Instant::now();
-                    crate::shadow::elide::cpu_read(p.src, p.len);
                     if crate::descriptor::in_shader_heap(p.dst, p.len) {
                         crate::port_journal::prep_wrote();
                     }
@@ -8471,8 +8357,6 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
-                    let (at, len) = staging.memory();
-                    crate::shadow::elide::cpu_read(at, len);
                     if batch.texture_due(staging) {
                         batch.due.push(staging.clone());
                         if !wide_textures() {
@@ -8490,8 +8374,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::Plane((at, len), fill) => {
-                    crate::shadow::elide::cpu_read(*at, *len);
+                Step::Plane((_, len), fill) => {
                     let started = std::time::Instant::now();
                     fill();
                     PREPARING[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -8733,7 +8616,7 @@ struct Batch {
     index: ByCopy<usize>,
     /// Staging buffers (by address) refreshed since the last title write,
     /// or due to be.
-    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
+    textures: std::collections::HashSet<usize>,
     /// Those due ([`Batch::refresh_textures`]).
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// What copies at their place in the submission's lists put into title
@@ -8782,72 +8665,12 @@ fn refresh_front() -> bool {
     ahead_of_writes() && (joins_asked().0 > 1 || *ON.get_or_init(|| crate::switch::on("SCARLETT_REFRESH_FRONT")))
 }
 
-struct FrontCopy<T> {
-    copy: T,
-    from: usize,
-    to: usize,
-    written_in: usize,
-}
-
-/// Accumulates refresh ranges in first-touch order while walking the lists.
-/// A write can be the first touch even when the first eligible refresh of
-/// that copy comes several parts later.
-struct FrontPlan<T> {
-    indices: ByCopy<usize>,
-    copies: Vec<FrontCopy<T>>,
-    last: Option<(usize, usize)>,
-    part: usize,
-}
-
-impl<T: Clone> FrontPlan<T> {
-    fn new() -> Self {
-        Self { indices: ByCopy::default(), copies: Vec::new(), last: None, part: 1 }
-    }
-
-    fn next_part(&mut self) {
-        self.part += 1;
-    }
-
-    fn entry(&mut self, key: usize, copy: &T) -> &mut FrontCopy<T> {
-        if let Some((last_key, index)) = self.last && last_key == key {
-            return &mut self.copies[index];
-        }
-        let index = *self.indices.entry(key).or_insert_with(|| {
-            let index = self.copies.len();
-            self.copies.push(FrontCopy { copy: copy.clone(), from: usize::MAX, to: 0, written_in: 0 });
-            index
-        });
-        self.last = Some((key, index));
-        &mut self.copies[index]
-    }
-
-    fn refresh(&mut self, key: usize, copy: &T, from: usize, to: usize) {
-        let part = self.part;
-        let entry = self.entry(key, copy);
-        if entry.written_in != part {
-            entry.from = entry.from.min(from);
-            entry.to = entry.to.max(to);
-        }
-    }
-
-    fn write(&mut self, key: usize, copy: &T) {
-        let part = self.part;
-        self.entry(key, copy).written_in = part;
-    }
-
-    fn into_spans(self) -> Vec<(T, usize, usize)> {
-        self.copies.into_iter().filter(|e| e.from < e.to).map(|e| (e.copy, e.from, e.to)).collect()
-    }
-}
-
-/// Two-pass reference used to verify both production planners.
 /// Per copy what is refreshed in front of a submission's steps, as
 /// [`written_spans`]'s but of all copies, up to the copy's first write by
 /// shaders in each part of the submission (`Touch::Part`: another begins).
 /// What a part refreshes of a copy it has given to its shaders stays where it
 /// stands: around what they write. What a later part refreshes is the
 /// title's bytes of before either.
-#[cfg(test)]
 fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
     let mut at: ByCopy<usize> = ByCopy::default();
     // (Copy, from, to), in the order they come, and the part that gave it to
@@ -8894,7 +8717,7 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
 /// each list's part beside the submitting thread (renderer port #6).
 const WIDE_PLAN_STEPS: usize = 4096;
 
-/// One list's part of the front refresh plan (renderer port #6, [`list_front`]).
+/// One list's part of [`front_spans`] (renderer port #6, [`list_front`]).
 #[derive(Default)]
 struct ListFront {
     /// The copies it touches, in the order of their first touch, each with
@@ -8908,7 +8731,7 @@ struct ListFront {
     textures: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
-/// A list's front refresh steps, folded per copy
+/// A list's steps as [`front_spans`] takes them, folded per copy
 /// ([`ListFront`]).
 fn list_front(steps: &[Step], textures: bool) -> ListFront {
     let mut shadows: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>)> = Vec::new();
@@ -8965,7 +8788,7 @@ fn fold_touches(touches: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usiz
     copies
 }
 
-/// Front refresh spans of the lists whose parts are `lists` ([`fold_touches`]), a
+/// [`front_spans`] of the lists whose parts are `lists` ([`fold_touches`]), a
 /// new part of the submission beginning at each of `parts`: the same spans,
 /// in the same order (`front_tests`).
 fn join_keys<'a>(lists: impl Iterator<Item = &'a [(usize, usize, usize, bool)]>, parts: &[usize]) -> Vec<(usize, usize, usize)> {
@@ -9013,7 +8836,7 @@ fn join_fronts(fronts: &[ListFront], parts: &[usize]) -> Vec<(std::sync::Arc<cra
 
 #[cfg(test)]
 mod front_tests {
-    use super::{FrontPlan, Touch, fold_touches, front_spans, join_keys};
+    use super::{Touch, fold_touches, front_spans, join_keys};
 
     /// Random submissions of lists (refreshes and shaders' writes of a few
     /// copies, new parts now and then): each list folded on its own and the
@@ -9031,13 +8854,11 @@ mod front_tests {
             let copies = 1 + next(6);
             let mut parts = Vec::new();
             let mut whole: Vec<Touch> = Vec::new();
-            let mut streamed = FrontPlan::new();
             let mut folds = Vec::new();
             for n in 0..lists {
                 if n > 0 && next(4) == 0 {
                     parts.push(n);
                     whole.push(Touch::Part);
-                    streamed.next_part();
                 }
                 let mut mine: Vec<Touch> = Vec::new();
                 for _ in 0..next(12) {
@@ -9045,19 +8866,16 @@ mod front_tests {
                     if next(5) == 0 {
                         mine.push(Touch::Write(key));
                         whole.push(Touch::Write(key));
-                        streamed.write(key, &key);
                     } else {
                         let from = next(100);
                         let to = from + 1 + next(50);
                         mine.push(Touch::Refresh(key, from, to));
                         whole.push(Touch::Refresh(key, from, to));
-                        streamed.refresh(key, &key, from, to);
                     }
                 }
                 folds.push(fold_touches(mine.into_iter()));
             }
             let want = front_spans(whole.into_iter());
-            assert_eq!(streamed.into_spans(), want, "parts {parts:?}");
             let got = join_keys(folds.iter().map(|f| f.as_slice()), &parts);
             assert_eq!(got, want, "parts {parts:?}");
         }
@@ -9074,7 +8892,6 @@ enum Touch {
     Title,
     Nothing,
     /// Another part of the submission begins.
-    #[cfg_attr(not(test), allow(dead_code))]
     Part,
 }
 
@@ -9205,23 +9022,6 @@ fn wide_textures() -> bool {
     *ON.get_or_init(|| std::env::var_os("SCARLETT_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh())
 }
 
-/// Whether a flush's due textures are refreshed in the same pass over the
-/// threads as its copies' refreshes (`SCARLETT_FLUSH_TOGETHER=0` turns it
-/// off), as [`Batch::refresh_spans`] does.
-///
-/// Each of a submission's 40-odd flushes a frame refreshed its textures,
-/// waited for every thread, then refreshed its copies in a second pass:
-/// while a large texture was read, hashed and detiled the other threads had
-/// nothing to do (scar14: 17.7 ms of the submitting thread's time a frame in
-/// flushes for 13.6 ms of texture work over all threads, the card idle 34 of
-/// 36 ms behind it). A texture's refresh reads title memory and writes its
-/// staging buffer, a copy's reads title memory and writes the copy: nothing
-/// of each other's.
-fn flush_together() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SCARLETT_FLUSH_TOGETHER").is_none_or(|v| v != "0") && wide_textures())
-}
-
 /// `SCARLETT_FILLS_HERE=1` (off by default; live with `SCARLETT_AB`): a
 /// submission's fills of upload memory are copied on the submitting thread,
 /// in order, never handed to the `scarlett-wide` threads. The bytes and the
@@ -9290,20 +9090,15 @@ impl Batch {
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
-    fn timed_update(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> (u64, u64) {
+    fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
         let started = std::time::Instant::now();
         let _one = crate::timeline::span("a copy's refresh");
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
-        (us, copied as u64)
-    }
-
-    fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
-        let (us, copied) = Self::timed_update(shadow, from, to);
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
-        PREPARING[1].fetch_add(copied, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -9329,8 +9124,8 @@ impl Batch {
         // joined here in order (`list_front`, `join_fronts`): one submission
         // a frame has most of the frame's steps, 3-6 ms of this alone (run
         // guard-4).
-        if crate::watch::port_guard_plan() && runs.len() >= 2
-            && runs.iter().map(|list| list.deferred().copies.len()).sum::<usize>() >= WIDE_PLAN_STEPS {
+        let steps: usize = runs.iter().map(|list| list.deferred().copies.len()).sum();
+        if crate::watch::port_guard_plan() && runs.len() >= 2 && steps >= WIDE_PLAN_STEPS {
             #[derive(Clone, Copy)]
             struct Lists(*const *const HostList, usize);
             // SAFETY: the lists outlive the call, which waits for every job.
@@ -9364,19 +9159,24 @@ impl Batch {
             self.refresh_spans(spans, due, planning);
             return;
         }
-        let mut plan = FrontPlan::new();
+        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
+        let mut touches = Vec::new();
         for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {
-                plan.next_part();
+                touches.push(Touch::Part);
             }
+            let mut last = 0;
             for step in &list.deferred().copies {
                 match step {
                     Step::Refresh(shadow, at, len) => {
-                        plan.refresh(std::sync::Arc::as_ptr(shadow) as usize, shadow, *at, *at + *len);
+                        let key = std::sync::Arc::as_ptr(shadow) as usize;
+                        if key != last {
+                            copies.entry(key).or_insert_with(|| shadow.clone());
+                            last = key;
+                        }
+                        touches.push(Touch::Refresh(key, *at, *at + *len));
                     }
-                    Step::GpuWrite(shadow, ..) => {
-                        plan.write(std::sync::Arc::as_ptr(shadow) as usize, shadow);
-                    }
+                    Step::GpuWrite(shadow, ..) => touches.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
                     Step::Texture(staging) | Step::TextureReady(staging) if wide_textures() => {
                         if self.texture_due(staging) {
                             due.push(staging.clone());
@@ -9387,7 +9187,11 @@ impl Batch {
             }
         }
         planning.next("refreshes in front: the spans");
-        self.refresh_spans(plan.into_spans(), due, planning);
+        let spans: Vec<_> = front_spans(touches.into_iter())
+            .into_iter()
+            .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
+            .collect();
+        self.refresh_spans(spans, due, planning);
     }
 
     /// The rest of [`Batch::refresh_front`]: `spans` brought up to date in
@@ -9458,10 +9262,7 @@ impl Batch {
         }
         // The time counted is the time it took, not the threads' sum.
         let took = started.elapsed().as_micros() as u64;
-        let summed = [
-            PREPARING[0].load(Ordering::Relaxed).saturating_sub(before[0]),
-            PREPARING[2].load(Ordering::Relaxed).saturating_sub(before[1]),
-        ];
+        let summed = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed)).iter().zip(before).map(|(now, was)| now.saturating_sub(was)).collect::<Vec<_>>();
         PREPARING[2].fetch_sub(summed[1], Ordering::Relaxed);
         PREPARING[0].fetch_sub(summed[0], Ordering::Relaxed);
         PREPARING[0].fetch_add(took, Ordering::Relaxed);
@@ -9561,10 +9362,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        // (With the copies' refreshes, in `flush_all`, if there are enough.)
-        if !(flush_together() && crate::watch::light() && self.refreshes.len() >= 4) {
-            self.refresh_textures();
-        }
+        self.refresh_textures();
         self.index.clear();
         if self.refreshes.is_empty() {
             return;
@@ -9600,12 +9398,6 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
-        // The textures `flush` left for the pass below ([`flush_together`]),
-        // done first here if there is no such pass after all.
-        if !self.due.is_empty() && !(light && wide_refresh() && self.refreshes.len() >= 4) {
-            self.refresh_textures();
-        }
-        let due = std::mem::take(&mut self.due);
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
         let ahead = self.refreshes.len() > 1;
@@ -9628,54 +9420,17 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
             if light {
-                // Most refreshes are unchanged. Claim and count short
-                // stretches of them together.
+                // A number to a free thread, not a job to each copy.
                 let refreshes = std::mem::take(&mut self.refreshes);
-                let check = refreshes.len() > FEW || beside;
-                let grain = if refreshes.len() < 64 { 1 } else { 8 };
-                // The textures first, each a piece of its own (they are the
-                // longer ones), then the copies' refreshes `grain` at a time.
-                let textures = due.len();
-                let before_textures = PREPARING[2].load(Ordering::Relaxed);
-                let _textures = (textures != 0).then(|| crate::timeline::span("textures brought up to date"));
-                crate::shadow::wide_each(textures + refreshes.len().div_ceil(grain), move |i| {
-                    let Some(i) = i.checked_sub(textures) else {
-                        due[i].refresh();
+                crate::shadow::wide_each(refreshes.len(), move |i| {
+                    let (shadow, from, to) = &refreshes[i];
+                    if (refreshes.len() > FEW || beside) && shadow.nothing_new(*from, *to - *from) {
+                        #[cfg(feature = "diagnostics")]
+                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                         return;
-                    };
-                    let range = i * grain..((i + 1) * grain).min(refreshes.len());
-                    let (mut us, mut bytes) = (0, 0);
-                    #[cfg(feature = "diagnostics")]
-                    let mut unchanged = 0;
-                    for (shadow, from, to) in &refreshes[range] {
-                        if check && shadow.nothing_new(*from, *to - *from) {
-                            #[cfg(feature = "diagnostics")]
-                            {
-                                unchanged += 1;
-                            }
-                            continue;
-                        }
-                        let (took, copied) = Self::timed_update(shadow, *from, *to);
-                        us += took;
-                        bytes += copied;
                     }
-                    if us != 0 {
-                        PREPARING[0].fetch_add(us, Ordering::Relaxed);
-                    }
-                    if bytes != 0 {
-                        PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
-                    }
-                    #[cfg(feature = "diagnostics")]
-                    if unchanged != 0 {
-                        FLUSHES[2].fetch_add(unchanged, Ordering::Relaxed);
-                    }
+                    Self::update(shadow, *from, *to);
                 });
-                // The time counted is the time it took (below, all as the
-                // copies'), not the threads' sum.
-                if textures != 0 {
-                    let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before_textures);
-                    PREPARING[2].fetch_sub(summed, Ordering::Relaxed);
-                }
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                     .refreshes
@@ -10295,25 +10050,23 @@ impl Meter {
         {
             let [passes, pieces, compares, original_compares, original_pieces, compare_pieces] =
                 [0, 1, 2, 3, 4, 5].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            let wc_left = crate::shadow::WC_LEFT.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
-            if passes + compares + wc_left > 0.0 {
+            if passes + compares > 0.0 {
                 tracing::info!(
-                    "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after                      ranges were sent up (SCARLETT_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes                      over {compare_pieces:.0} pieces (before coalescing: {original_compares:.0} passes over {original_pieces:.0} pieces);                      {wc_left:.1} MB declared written in write-combined memory left on the card (SCARLETT_WC_NO_BACK)",
+                    "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
+                     ranges were sent up (SCARLETT_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes \
+                     over {compare_pieces:.0} pieces (before coalescing: {original_compares:.0} passes over {original_pieces:.0} pieces)",
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
         }
         {
-            let [own, asking, still, all, detiling, hashing] =
-                [0, 1, 2, 3, 4, 5].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            let [own, asking, still, all] =
+                [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
             if all >= 1.0 {
                 tracing::info!(
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
-                     hold still (the runtime remapping it); the rest is reading, hashing and detiling ({detiling:.1} ms detiling, \
-                     {hashing:.1} ms hashing, these also outside refreshes); the longest one {longest:.1} ms ({longest_mb:.1} MB)",
-                    longest = crate::texture::REFRESH_LONGEST[0].swap(0, Ordering::Relaxed) as f64 / 1000.0,
-                    longest_mb = crate::texture::REFRESH_LONGEST[1].swap(0, Ordering::Relaxed) as f64 / 1048576.0,
+                     hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
             }
             let [through, left, filled, short] =
@@ -10513,7 +10266,6 @@ impl Meter {
                     put[2] / 1e6,
                     put[3]
                 );
-                crate::shadow::elide::log(frames);
                 traffic::line(self.copy_stats_frames as f64);
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
@@ -12417,22 +12169,14 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn textures_are_kept_while_the_card_has_room() {
-        use super::{keep_percents, vram_keep_at};
+        use super::vram_keep;
         let gib = 1 << 30;
-        let vram_keep = |budget, used| vram_keep_at(budget, used, 88, 85);
         assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
         // Past it: the longest idle ones, enough to come down to 85 %.
         let (ms, bytes) = vram_keep(100 * gib, 90 * gib);
         assert_eq!((ms, bytes), (5_000, 5 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
-        // The default shares: from 75 % down to 70 %.
-        assert_eq!(keep_percents(""), [75, 70]);
-        assert_eq!(keep_percents("88,85"), [88, 85]);
-        assert_eq!(keep_percents("70,75"), [75, 70]);
-        assert_eq!(keep_percents("99,10"), [75, 70]);
-        assert_eq!(vram_keep_at(100 * gib, 74 * gib, 75, 70).0, 600_000);
-        assert_eq!(vram_keep_at(100 * gib, 80 * gib, 75, 70), (5_000, 10 * gib));
     }
 
     #[test]

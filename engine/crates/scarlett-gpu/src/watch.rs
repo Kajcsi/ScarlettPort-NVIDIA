@@ -3831,8 +3831,6 @@ pub fn title_memory_freed(at: usize, len: usize) {
     if span_end > at {
         copies_freed(at, span_end - at);
     }
-    // (`SCARLETT_WC_NO_BACK`: write-combined regions in it are forgotten.)
-    crate::shadow::write_combined_freed(at, len);
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {

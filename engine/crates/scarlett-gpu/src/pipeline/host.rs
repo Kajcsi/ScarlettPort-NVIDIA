@@ -627,9 +627,6 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
-        // Its static samplers have their places in the driver's table first
-        // (`sampler_order`): the same in every run.
-        super::sampler_order::before(&host.device, &samplers);
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -1571,9 +1568,9 @@ mod tests {
             };
             // SAFETY: open command list, live resources and views.
             unsafe {
-                list.list.ClearRenderTargetView(rtv.handle, &[0.0; 4], None);
-                list.list.ClearDepthStencilView(dsv.handle, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None);
-                list.list.OMSetRenderTargets(1, Some(&rtv.handle), false, Some(&dsv.handle));
+                list.list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+                list.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None);
+                list.list.OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
                 list.list.RSSetViewports(&[vp]);
                 list.list.RSSetScissorRects(&[rect]);
                 list.list.SetGraphicsRootSignature(&root);
