@@ -166,6 +166,97 @@ pub fn replacement(kind: Kind, rate: u32) -> Vec<u8> {
     }
 }
 
+/// The simulation's longest step (`SCARLETT_MAX_STEP_MS`, 250 by default):
+/// +0x2226040 takes each timer's step as at most a constant of 1/15 s, read
+/// into a register at +0x2226045 (`vmovss xmm3, [rip+...]`, the shared
+/// .rdata constant at +0x6159ec0, which other code reads too). Below 15
+/// frames a second the game then ran slower than real time: at scar12's
+/// median of 12, at 80 % of its speed. The load is pointed at a float of
+/// our own in the int3 padding after the function (+0x2226128), so only
+/// this step changes. Frames longer than the new longest step (loading
+/// hitches) still slow the game down rather than jump it ahead.
+pub const STEP_LOAD: usize = 0x2226045;
+pub const STEP_LOAD_BYTES: [u8; 8] = [0xc5, 0xfa, 0x10, 0x1d, 0x73, 0x3e, 0xf3, 0x03];
+pub const STEP_CONSTANT: usize = 0x2226128;
+
+/// The longest step asked for, in seconds: `SCARLETT_MAX_STEP_MS` (from 1/15 s
+/// to 1 s), 250 ms without it; `None` for `off` (the title's 1/15 s) or a
+/// malformed value (said why).
+pub fn asked_max_step() -> Option<f32> {
+    let spec = std::env::var("SCARLETT_MAX_STEP_MS").unwrap_or_else(|_| "250".into());
+    let step = parse_max_step(&spec);
+    if step.is_none() && spec.trim() != "off" {
+        eprintln!("VIctory: SCARLETT_MAX_STEP_MS={spec}: expected milliseconds from 67 to 1000, or off");
+    }
+    step
+}
+
+/// `250` → 0.25 s; `off`, or less than the title's own 1/15 s, or more than a
+/// second → `None`.
+pub fn parse_max_step(spec: &str) -> Option<f32> {
+    let ms = spec.trim().parse::<f32>().ok()?;
+    (ms.is_finite() && (1000.0 / 15.0..=1000.0).contains(&ms)).then_some(ms / 1000.0)
+}
+
+/// The load of the step's limit pointed at our float (the same instruction,
+/// another displacement).
+pub fn step_load(at: usize, constant: usize) -> [u8; 8] {
+    let next = at + STEP_LOAD_BYTES.len();
+    let disp = (constant as i64 - next as i64) as i32;
+    let mut code = STEP_LOAD_BYTES;
+    code[4..].copy_from_slice(&disp.to_le_bytes());
+    code
+}
+
+/// Makes the simulation's longest step `seconds` in the image of `size`
+/// bytes at `base` (said in the log too).
+///
+/// # Safety
+/// The image stays mapped and no thread runs its code yet.
+#[cfg(windows)]
+pub unsafe fn apply_max_step(base: usize, size: usize, seconds: f32) -> Patched {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let done = (|| {
+        if STEP_LOAD + 8 > size || STEP_CONSTANT + 4 > size {
+            return Patched::Failed("outside the image");
+        }
+        let (load, constant) = (base + STEP_LOAD, base + STEP_CONSTANT);
+        // SAFETY: inside the mapped image (checked above).
+        let (there, pad) = unsafe {
+            (
+                std::slice::from_raw_parts(load as *const u8, 8),
+                std::slice::from_raw_parts(constant as *const u8, 4),
+            )
+        };
+        if there != STEP_LOAD_BYTES || pad != [0xcc; 4] {
+            return Patched::Differs;
+        }
+        let code = step_load(STEP_LOAD, STEP_CONSTANT);
+        let mut old = 0;
+        // SAFETY: the load and the padding, made writable for this and put
+        // back; nothing runs them yet.
+        unsafe {
+            for (at, bytes) in [(constant, &seconds.to_le_bytes()[..]), (load, &code[..])] {
+                if VirtualProtect(at as *const _, bytes.len(), PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+                    return Patched::Failed("Windows would not make it writable");
+                }
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len());
+                VirtualProtect(at as *const _, bytes.len(), old, &mut old);
+                FlushInstructionCache(GetCurrentProcess(), at as *const _, bytes.len());
+            }
+        }
+        Patched::Done
+    })();
+    match done {
+        Patched::Done => tracing::info!(seconds, "game speed: the simulation's longest step patched (SCARLETT_MAX_STEP_MS; the title's 1/15 s)"),
+        Patched::Differs => tracing::warn!("game speed: longest step not patched, the title's bytes there are not the ones expected (another build?)"),
+        Patched::Failed(why) => tracing::warn!(why, "game speed: longest step not patched"),
+    }
+    done
+}
+
 /// What became of a site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Patched {
@@ -227,6 +318,19 @@ pub unsafe fn apply(base: usize, size: usize, rate: u32, sites: &[Site]) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The longest step: a load of our float in the padding 0xdb bytes on.
+    #[test]
+    fn the_longest_step() {
+        assert_eq!(parse_max_step("250"), Some(0.25));
+        assert_eq!(parse_max_step("1000"), Some(1.0));
+        assert_eq!(parse_max_step("50"), None, "below the title's own");
+        assert_eq!(parse_max_step("off"), None);
+        assert_eq!(parse_max_step("2000"), None);
+        assert_eq!(step_load(STEP_LOAD, STEP_CONSTANT), [0xc5, 0xfa, 0x10, 0x1d, 0xdb, 0, 0, 0]);
+        // The title's own displacement names its constant at +0x6159ec0.
+        assert_eq!(step_load(STEP_LOAD, 0x6159ec0), STEP_LOAD_BYTES);
+    }
 
     #[test]
     fn intervals_and_rates() {

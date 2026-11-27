@@ -237,6 +237,15 @@ pub fn run(
             None => println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is"),
         }
     }
+    // Game speed at low frame rates (SCARLETT_MAX_STEP_MS, 250 by default,
+    // `off`: the title's 1/15 s): the simulation's longest step.
+    #[cfg(windows)]
+    if execute && let Some(seconds) = scarlett_loader::frame_rate::asked_max_step() {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        let done = unsafe { scarlett_loader::frame_rate::apply_max_step(image.base(), size, seconds) };
+        println!("game speed: the simulation's longest step {:.0} ms ({done:?}); full speed down to {:.1} fps", seconds * 1000.0, 1.0 / seconds);
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
