@@ -381,15 +381,22 @@ pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
 }
 
 /// Calls `f` with every number below `count`, on this thread and on threads
-/// kept for making descriptors (`SCARLETT_VIEW_THREADS`, 4 with this one, 6 for records; 1:
-/// on this one alone). Those for `records`, the heaps' records copied as
+/// kept for making descriptors (`SCARLETT_VIEW_THREADS`, 4 with this one;
+/// `SCARLETT_RECORD_THREADS`, 6 for records; 1: on this one alone). Those for
+/// `records`, the heaps' records copied as
 /// bytes, are others than those for the views picked by index: submissions
 /// wait for the first, lists for the second, and each kept the other waiting.
 pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOLS: [OnceLock<&'static Pool>; 2] = [const { OnceLock::new() }; 2];
     POOLS[usize::from(records)]
         .get_or_init(|| {
-            let threads = std::env::var("SCARLETT_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(if records { 6usize } else { 4 });
+            let key = if records { "SCARLETT_RECORD_THREADS" } else { "SCARLETT_VIEW_THREADS" };
+            let threads = std::env::var(key)
+                .ok()
+                // Keep SCARLETT_VIEW_THREADS as the legacy records override.
+                .or_else(|| records.then(|| std::env::var("SCARLETT_VIEW_THREADS").ok()).flatten())
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(if records { 6usize } else { 4 });
             Pool::new(if records { "scarlett-records" } else { "scarlett-views" }, threads.clamp(1, 16))
         })
         .each(count, f);

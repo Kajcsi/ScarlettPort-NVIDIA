@@ -747,9 +747,48 @@ impl<T> HeapRanges<T> {
     }
 }
 
+/// Merges two ordered slot sets without making a descriptor that occurs in
+/// both sets twice. The periodic heap slice and the slots written since the
+/// last pass overlap often in titles that rebuild tables every frame.
+fn merge_slots(first: Vec<u32>, second: Vec<u32>) -> Vec<u32> {
+    if first.is_empty() {
+        return second;
+    }
+    if second.is_empty() {
+        return first;
+    }
+    let mut out = Vec::with_capacity(first.len() + second.len());
+    let (mut a, mut b) = (first.into_iter().peekable(), second.into_iter().peekable());
+    while a.peek().is_some() || b.peek().is_some() {
+        let next = match (a.peek(), b.peek()) {
+            (Some(&x), Some(&y)) if x < y => a.next().unwrap(),
+            (Some(&x), Some(&y)) if y < x => b.next().unwrap(),
+            (Some(_), Some(_)) => {
+                let value = a.next().unwrap();
+                b.next();
+                value
+            }
+            (Some(_), None) => a.next().unwrap(),
+            (None, Some(_)) => b.next().unwrap(),
+            (None, None) => unreachable!(),
+        };
+        if out.last() != Some(&next) {
+            out.push(next);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod heap_range_tests {
-    use super::{HEAP_ROUND, HeapRanges};
+    use super::{HEAP_ROUND, HeapRanges, merge_slots};
+
+    #[test]
+    fn periodic_and_changed_slots_are_looked_at_once() {
+        assert_eq!(merge_slots(vec![1, 4, 7, 10], vec![2, 4, 8, 10]), vec![1, 2, 4, 7, 8, 10]);
+        assert_eq!(merge_slots(Vec::new(), vec![2, 5]), vec![2, 5]);
+        assert_eq!(merge_slots(vec![2, 5], Vec::new()), vec![2, 5]);
+    }
 
     /// Round by round every slot is looked at again once, whatever was
     /// written between, and what a slot holds is what was found last.
@@ -1099,9 +1138,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         // The written ones, and this pass's part of the others.
         let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
         ranges.forget_part(part, parts);
-        let mut slots = host.buffer_slots_of(part, parts);
-        slots.extend(changed);
-        slots
+        merge_slots(host.buffer_slots_of(part, parts), changed)
     } else {
         changed
     };
