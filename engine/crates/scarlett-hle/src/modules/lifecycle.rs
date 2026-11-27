@@ -272,6 +272,15 @@ extern "system" fn window_proc(
     if (message == wm::WM_KEYUP || message == wm::WM_SYSKEYUP) && wparam == VK_F11 {
         return 0;
     }
+    // Alt+Enter toggles the same borderless fullscreen: DXGI's own handler
+    // (exclusive fullscreen, whose frames froze) is off, see the presenter.
+    // Bit 29: Alt is down.
+    if message == wm::WM_SYSKEYDOWN && wparam == VK_RETURN && lparam & (1 << 29) != 0 {
+        if lparam & (1 << 30) == 0 {
+            toggle_fullscreen(hwnd);
+        }
+        return 0;
+    }
     // Auto-hide the Windows cursor inside the game window's client area while
     // the keyboard-and-mouse mouse-look lock (`~` / `F2`) is active, and restore it immediately
     // when unlocked (`~` / `F2` / `Esc` / `P`).
@@ -315,6 +324,8 @@ extern "system" fn window_proc(
 
 /// The F11 key's virtual-key code.
 const VK_F11: usize = 0x7A;
+/// The Enter key's virtual-key code.
+const VK_RETURN: usize = 0x0D;
 
 /// Borderless fullscreen over the monitor the window is on, or back to the
 /// style and placement it had before. What the title draws is stretched to

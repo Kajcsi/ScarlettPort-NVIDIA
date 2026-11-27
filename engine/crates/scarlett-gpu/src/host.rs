@@ -10302,7 +10302,13 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let shown = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if shown.is_err() {
+                static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !TOLD.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(hresult = format_args!("{:#010x}", shown.0 as u32), "the host's Present failed: the picture is not updated");
+                }
+            }
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
@@ -10345,6 +10351,15 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            // DXGI's own Alt+Enter would make this flip-model swap chain
+            // exclusive fullscreen, after which every Present fails until
+            // ResizeBuffers (never called for a window change here): the
+            // picture froze while the title ran on, in every port, until
+            // windowed again. Alt+Enter is the window's borderless toggle
+            // instead (scarlett-hle lifecycle.rs, as F11).
+            if let Err(e) = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) {
+                tracing::warn!(error = %e, "DXGI's Alt+Enter could not be switched off");
+            }
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
