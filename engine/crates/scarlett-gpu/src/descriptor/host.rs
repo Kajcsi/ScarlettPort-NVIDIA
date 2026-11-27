@@ -2122,6 +2122,27 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 impl HostHeap {
+    /// The first of `n` consecutive free slots of `taken[..end]`, searched
+    /// from `cursor` on and then from the start (past the cursor by `n - 1`,
+    /// so that a run across the cursor is found); a run does not wrap past
+    /// the end.
+    fn free_run(taken: &[bool], cursor: usize, end: usize, n: usize) -> Option<usize> {
+        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+        let mut run = 0;
+        let mut last = usize::MAX;
+        for at in (cursor..end).chain(0..second_end) {
+            if at != last.wrapping_add(1) {
+                run = 0;
+            }
+            last = at;
+            run = if taken[at] { 0 } else { run + 1 };
+            if run == n {
+                return Some(at + 1 - n);
+            }
+        }
+        None
+    }
+
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
@@ -2137,27 +2158,8 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
         let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = if enough { Self::free_run(taken, *next as usize, end, n) } else { None };
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
@@ -2189,6 +2191,57 @@ impl HostHeap {
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
+    }
+
+    /// Up to `want.max(slab)` consecutive free dynamic slots in one taking of
+    /// the lock, else exactly `want`: the first's index and how many. A list
+    /// recorder hands its tables slots out of such a slab without the lock
+    /// (`crate::draw`, `SCARLETT_DYNAMIC_SLAB`); what it does not use it gives
+    /// back with [`HostHeap::release`].
+    ///
+    /// After ToLIManl/VIctory-Hydra's `dynamic_slab` (GPL-3.0-or-later),
+    /// measured there at 26.9 to 0.5 ms a frame of waiting for this lock over
+    /// 6,400 tables a frame on an RTX 3060 with a Ryzen 5 5600X.
+    pub(crate) fn dynamic_slab(&self, want: u32, slab: u32) -> Option<(u32, u32)> {
+        if self.sampler || want == 0 || want > self.dynamic {
+            return None;
+        }
+        let target = want.max(slab).min(self.dynamic);
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let (next, taken) = &mut *guard;
+        let free = self.free.load(std::sync::atomic::Ordering::Relaxed);
+        let too_long = self.too_long.load(std::sync::atomic::Ordering::Relaxed);
+        let end = self.dynamic as usize;
+        let fits = |n: u32| free >= n && n < too_long;
+        let found = if fits(target) { Self::free_run(taken, *next as usize, end, target as usize).map(|f| (f, target)) } else { None };
+        let found = found.or_else(|| {
+            if target > want && fits(want) { Self::free_run(taken, *next as usize, end, want as usize).map(|f| (f, want)) } else { None }
+        });
+        let Some((first, got)) = found else {
+            if fits(want) {
+                self.too_long.fetch_min(want, std::sync::atomic::Ordering::Relaxed);
+            }
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(n = want, "no free dynamic descriptor slots: a table is not made"));
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::DynamicRefused, 1);
+                add(C::DynamicNs, started.elapsed().as_nanos() as u64);
+            }
+            return None;
+        };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+        let got_n = got as usize;
+        taken[first..first + got_n].fill(true);
+        self.free.fetch_sub(got, std::sync::atomic::Ordering::Relaxed);
+        *next = ((first + got_n) % end) as u32;
+        Some((self.count + first as u32, got))
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -6054,6 +6107,29 @@ mod tests {
     }
 
     /// A constant buffer view larger than the host takes is cut to what it
+    /// A slab is one taking of the lock for many tables; its unused tail
+    /// goes back at once, and with little room it is the exact count asked.
+    /// (ToLIManl/VIctory-Hydra's test, GPL-3.0-or-later.)
+    #[test]
+    fn dynamic_slab_reserves_chunk_and_falls_back_to_exact_want() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            eprintln!("no host descriptor heap; skipped");
+            return;
+        };
+        let (first, got) = heap.dynamic_slab(3, 256).unwrap();
+        assert_eq!((first, got), (4, 256.min(heap.dynamic)));
+        heap.release(heap.id(), first + 3, got - 3);
+        let used = heap.dynamic(heap.dynamic - 20).unwrap();
+        assert_eq!(used, first + 3);
+        // Only 17 slots remain: 8 asked with a slab of 256 is exactly 8.
+        let (fallback_first, fallback_got) = heap.dynamic_slab(8, 256).unwrap();
+        assert_eq!(fallback_got, 8);
+        assert!(fallback_first >= heap.count);
+        heap.release(heap.id(), first, 3);
+        heap.release(heap.id(), used, heap.dynamic - 20);
+        heap.release(heap.id(), fallback_first, fallback_got);
+    }
+
     /// takes: the device, which such a view removes, stays.
     #[test]
     fn an_oversized_constant_buffer_view_leaves_the_device_alive() {
