@@ -603,7 +603,8 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// default, none): one buffer (`D3D12_HEAP_TYPE_GPU_UPLOAD`), no CPU's side, no
 /// copy to send and no list of changes, unlike [`window_card_most`]. The CPU
 /// only writes them, as no shader is declared to write a window; if one were,
-/// its snapshot and compare would read through the bus, right but slow. In a
+/// its snapshot and compare would read through the bus, right but slow (said,
+/// and that range's window is made elsewhere next time: [`mapped_written`]). In a
 /// captured frame the lists take 26 ms of the card instead of 29, the frame 32
 /// instead of 36; filling them costs the CPU what it did.
 ///
@@ -618,6 +619,37 @@ fn window_mapped_most() -> u64 {
 
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Windows (start, length) in card memory the CPU maps that a shader was
+/// declared to write: their snapshot and compare read the mapping through
+/// the bus. A window made again for such a range (after it was let go) is
+/// not put there ([`mapped_written`]).
+static MAPPED_WRITTEN: Mutex<std::collections::BTreeSet<(u64, u64)>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// A window in card memory the CPU maps, `[start, start + len)`, has a
+/// range declared written by shaders: noted, and said the first times.
+fn note_mapped_written(start: u64, len: u64, declared: usize) {
+    let mut set = MAPPED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if set.insert((start, len)) {
+        let n = set.len();
+        if n <= 16 || n.is_power_of_two() {
+            tracing::warn!(
+                start = format_args!("{start:#x}"),
+                len,
+                declared,
+                windows = n,
+                "a window in card memory the CPU maps is written by shaders: its snapshot and compare read it through the \
+                 bus (slow); made again, it goes elsewhere"
+            );
+        }
+    }
+}
+
+/// Whether the window `[start, start + len)` was a mapped one that shaders
+/// wrote ([`note_mapped_written`]).
+fn mapped_written(start: u64, len: u64) -> bool {
+    MAPPED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).contains(&(start, len))
+}
 
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
@@ -3210,6 +3242,9 @@ impl Shadow {
             return;
         }
         let range = (address, address + len);
+        if self.mapped {
+            note_mapped_written(self.start, self.len, len);
+        }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
@@ -5495,8 +5530,11 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    // One buffer in the card's memory, filled by the CPU through the bus.
-    if let Some((buffer, data)) = window_mapped_for(len) {
+    // One buffer in the card's memory, filled by the CPU through the bus
+    // (not for a range shaders wrote there before: the CPU would read it).
+    if !mapped_written(start, len)
+        && let Some((buffer, data)) = window_mapped_for(len)
+    {
         crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
