@@ -74,11 +74,17 @@ impl Placed {
         }
     }
 
+    /// Whether the CPU takes the source's bytes at submission (the list
+    /// copies out of its upload memory, not out of a host copy).
+    pub(super) fn bytes_known(&self) -> bool {
+        self.from.is_some()
+    }
+
     /// At submission, in the order of the steps: the list's upload memory
     /// takes the source's bytes and, if `free` (no flight in the air may write
-    /// source or destination), title memory at the destination does. Gives
-    /// the bytes if it took them.
-    pub(super) fn prepare(&self, free: bool) -> Option<Vec<u8>> {
+    /// source or destination), title memory at the destination does. The
+    /// bytes, if they were taken, and whether title memory took them.
+    pub(super) fn prepare(&self, free: bool) -> Option<(Vec<u8>, bool)> {
         if !free && self.from.is_none() {
             return None;
         }
@@ -90,13 +96,173 @@ impl Placed {
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), to as *mut u8, self.len) };
         }
         if !free {
-            return None;
+            return Some((bytes, false));
         }
         copy_mapped(self.dst as *mut u8, bytes.as_ptr(), self.len, true);
         crate::watch::wrote(self.dst, self.len);
         // Title memory that is not all there was left alone.
         let mut there = vec![0u8; self.len];
-        (read_into(self.dst as *const u8, &mut there) && there == bytes).then_some(bytes)
+        let took = read_into(self.dst as *const u8, &mut there) && there == bytes;
+        Some((bytes, took))
+    }
+}
+
+/// Whether a fill of upload memory that reads only what copies at their
+/// place earlier in the submission wrote takes their bytes as the CPU took
+/// them at submission, instead of waiting for flights
+/// (`SCARLETT_PLACED_BYTES=0`: it waits, as before).
+///
+/// Such a copy writes the destination over whatever flights in the air put
+/// there, so title memory, which flights may still write, is not read: but
+/// where a flight may write the source or the destination, title memory does
+/// not take the copy's bytes at submission ([`Placed::prepare`]), and every
+/// fill behind it that read them waited for the flights, and was not done on
+/// the card either ([`card_steps`]: it reads what a copy at its place
+/// writes). Run scar13: some 100 ms a frame, one wait a frame, for a fill
+/// of 560 bytes of constants.
+pub(super) fn serve_fills() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SCARLETT_PLACED_BYTES").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame-rate line: fills that took a copy's bytes so.
+pub(super) static SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Title memory, at a step of a submission, that copies at their place
+/// earlier in it wrote with bytes the CPU takes at submission, out of a
+/// source no flight in the air writes ([`serve_fills`]). In order, joined.
+#[derive(Default)]
+pub(super) struct Known(Vec<(usize, usize)>);
+
+impl Known {
+    /// A step writes `[from, to)`: with bytes known (`known`) or not.
+    fn write(&mut self, from: usize, to: usize, known: bool) {
+        if from >= to || (self.0.is_empty() && !known) {
+            return;
+        }
+        let mut out = Vec::with_capacity(self.0.len() + 2);
+        for &(a, b) in &self.0 {
+            if b <= from || to <= a {
+                out.push((a, b));
+                continue;
+            }
+            if a < from {
+                out.push((a, from));
+            }
+            if to < b {
+                out.push((to, b));
+            }
+        }
+        if known {
+            out.push((from, to));
+        }
+        merge_ranges(&mut out);
+        self.0 = out;
+    }
+
+    /// Whether `[from, to)` is all known.
+    fn covers(&self, from: usize, to: usize) -> bool {
+        let at = self.0.partition_point(|r| r.1 <= from);
+        self.0.get(at).is_some_and(|r| r.0 <= from && to <= r.1)
+    }
+
+    /// Follows `step` against `written`, what flights may write: whether it
+    /// is a fill that reads known bytes only.
+    pub(super) fn serves(&mut self, step: &Step, written: &[(usize, usize)]) -> bool {
+        if !serve_fills() {
+            return false;
+        }
+        match step {
+            Step::Placed(p) => {
+                let known = p.bytes_known() && !touches(written, p.src, p.src + p.len);
+                self.write(p.dst, p.dst + p.len, known);
+                false
+            }
+            &Step::Copy(dst, _, len) => {
+                self.write(dst, dst + len, false);
+                false
+            }
+            Step::Run(_) => {
+                self.0.clear();
+                false
+            }
+            &Step::Fill(_, src, len, _) => !self.0.is_empty() && self.covers(src, src + len),
+            _ => false,
+        }
+    }
+}
+
+/// The bytes of [`Known`], at a step of a submission being prepared: the
+/// title address of each, not overlapping.
+#[derive(Default)]
+pub(super) struct Overlay(Vec<(usize, Vec<u8>)>);
+
+impl Overlay {
+    /// A step wrote `len` bytes at `at`: these (`Some`), or ones title
+    /// memory holds now.
+    pub(super) fn write(&mut self, at: usize, len: usize, bytes: Option<Vec<u8>>) {
+        let to = at + len;
+        if len == 0 || (self.0.is_empty() && bytes.is_none()) {
+            return;
+        }
+        let mut out = Vec::with_capacity(self.0.len() + 2);
+        for (a, held) in std::mem::take(&mut self.0) {
+            let b = a + held.len();
+            if b <= at || to <= a {
+                out.push((a, held));
+                continue;
+            }
+            if to < b {
+                out.push((to, held[to - a..].to_vec()));
+            }
+            if a < at {
+                let mut held = held;
+                held.truncate(at - a);
+                out.push((a, held));
+            }
+        }
+        if let Some(bytes) = bytes {
+            out.push((at, bytes));
+        }
+        self.0 = out;
+    }
+
+    /// Something wrote title memory anywhere.
+    pub(super) fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Fills `len` bytes at `dst` with title memory at `src` as the steps so
+    /// far left it, if bytes held here lie in it: `false` if none do.
+    pub(super) fn fill(&self, dst: usize, src: usize, len: usize) -> bool {
+        let to = src + len;
+        let mut met = false;
+        let mut covered = 0;
+        for (a, held) in &self.0 {
+            let b = a + held.len();
+            if *a < to && src < b {
+                met = true;
+                covered += b.min(to) - (*a).max(src);
+            }
+        }
+        if !met {
+            return false;
+        }
+        if covered < len {
+            copy_mapped(dst as *mut u8, src as *const u8, len, false);
+        }
+        for (a, held) in &self.0 {
+            let b = a + held.len();
+            if *a < to && src < b {
+                let (from, until) = ((*a).max(src), b.min(to));
+                // SAFETY: the fill's own upload memory of `len` bytes; the
+                // part of it that lies over these.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(held.as_ptr().add(from - a), (dst + (from - src)) as *mut u8, until - from);
+                }
+            }
+        }
+        true
     }
 }
 
@@ -109,11 +275,15 @@ pub(super) enum Waits {
     Yes,
 }
 
-/// Whether a step of `runs` reads one of `ranges` on the CPU.
-pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bool {
+/// Whether a step of `runs` reads one of `ranges` on the CPU. `served`: the
+/// fills (their list by address, their place in it, in order) that read
+/// known bytes instead ([`Known`]).
+pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>, served: &[(usize, usize)]) -> bool {
     join_ranges(&mut ranges, []);
     runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
+        let at = std::ptr::from_ref::<HostList>(list) as usize;
+        list.deferred().copies.iter().enumerate().any(|(i, step)| match step {
+            Step::Fill(..) if served.binary_search(&(at, i)).is_ok() => false,
             &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => touches(&ranges, src, src + len),
             Step::Texture(staging) | Step::TextureReady(staging) => {
                 let (at, len) = staging.memory();
@@ -294,6 +464,59 @@ impl HostList {
 
 #[cfg(test)]
 mod tests {
+    use super::{Known, Overlay};
+
+    #[test]
+    fn known_bytes_follow_the_writes() {
+        let mut k = Known::default();
+        k.write(100, 200, true);
+        assert!(k.covers(120, 180) && k.covers(100, 200));
+        assert!(!k.covers(90, 120) && !k.covers(150, 210));
+        // Written over with bytes not known: the rest stays known.
+        k.write(150, 160, false);
+        assert!(!k.covers(120, 180));
+        assert!(k.covers(100, 150) && k.covers(160, 200));
+        // Known again, and joined with what touches it.
+        k.write(150, 160, true);
+        assert!(k.covers(100, 200));
+        k.write(200, 220, true);
+        assert!(k.covers(180, 220));
+        k.0.clear();
+        assert!(!k.covers(100, 101));
+    }
+
+    #[test]
+    fn fills_take_the_bytes_held() {
+        let title = vec![1u8; 64];
+        let src = title.as_ptr() as usize;
+        let mut o = Overlay::default();
+        let mut dst = vec![0u8; 64];
+        // Nothing held: the fill is left to title memory.
+        assert!(!o.fill(dst.as_mut_ptr() as usize, src, 64));
+        o.write(src + 16, 16, Some(vec![9; 16]));
+        assert!(o.fill(dst.as_mut_ptr() as usize, src, 64));
+        assert_eq!(&dst[..16], &[1; 16]);
+        assert_eq!(&dst[16..32], &[9; 16]);
+        assert_eq!(&dst[32..], &[1; 32]);
+        // Partly written over by a step that left its bytes in title memory.
+        o.write(src + 20, 4, None);
+        let mut dst = vec![0u8; 16];
+        assert!(o.fill(dst.as_mut_ptr() as usize, src + 16, 16));
+        assert_eq!(dst, [9, 9, 9, 9, 1, 1, 1, 1, 9, 9, 9, 9, 9, 9, 9, 9]);
+        // All of it held: title memory is not read.
+        let mut dst = vec![0u8; 4];
+        assert!(o.fill(dst.as_mut_ptr() as usize, src + 24, 4));
+        assert_eq!(dst, [9; 4]);
+        // Newer bytes over older ones.
+        o.write(src + 26, 4, Some(vec![5; 4]));
+        let mut dst = vec![0u8; 8];
+        assert!(o.fill(dst.as_mut_ptr() as usize, src + 24, 8));
+        assert_eq!(dst, [9, 9, 5, 5, 5, 5, 9, 9]);
+        o.clear();
+        assert!(!o.fill(dst.as_mut_ptr() as usize, src, 8));
+        drop(title);
+    }
+
     /// What copies with two sides cost to make (ignored: a measurement for
     /// `SCARLETT_CARD_ALL`): buffers of 64 KiB on the card and in the PC's
     /// memory.

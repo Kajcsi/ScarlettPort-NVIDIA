@@ -3404,8 +3404,17 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     }
     // Destinations of copies at their place, if a step reads them.
     let mut placed: Vec<(usize, usize)> = Vec::new();
+    // What such copies wrote with bytes known, and the fills that read only
+    // that ([`place::Known`]).
+    let mut known = place::Known::default();
+    let mut served: Vec<(usize, usize)> = Vec::new();
     for list in runs {
-        for step in &list.deferred().copies {
+        let at = std::ptr::from_ref::<HostList>(list) as usize;
+        for (i, step) in list.deferred().copies.iter().enumerate() {
+            if known.serves(step, written) {
+                served.push((at, i));
+                continue;
+            }
             match step {
                 &Step::Copy(dst, src, len) => {
                     if let Some(_read) = copy_blocked(written, dst, src, len) {
@@ -3469,7 +3478,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
             }
         }
     }
-    (!placed.is_empty() && place::read_by(runs, placed)).then_some(WHY_READ)
+    served.sort_unstable();
+    (!placed.is_empty() && place::read_by(runs, placed, &served)).then_some(WHY_READ)
 }
 
 /// With flights in the air, after the submission's write-watch asking:
@@ -4128,11 +4138,19 @@ fn late_line(frames: f64) {
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
-            "title buffer copies at their place in the lists, per frame (SCARLETT_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote",
+            "title buffer copies at their place in the lists, per frame (SCARLETT_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote; {:.2} fills read a copy's bytes ahead of              title memory (SCARLETT_PLACED_BYTES)",
             t[0],
             t[1] / 1024.0,
             t[2],
             t[3],
+            place::SERVED.swap(0, Ordering::Relaxed) as f64 / frames,
+        );
+    }
+    if crate::descriptor::host::show_new_later() {
+        tracing::info!(
+            "slots of textures made while lists sent before them ran, shown once those had run (SCARLETT_SHOW_NEW_LATER=1), \
+             since the start: {}",
+            crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
         );
     }
     card_steps::log(frames);
@@ -8040,6 +8058,9 @@ impl HostList {
         let mut last: Option<(usize, std::time::Instant)> = None;
         for (i, step) in self.deferred().copies.iter().enumerate() {
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
+                if let &Step::Copy(dst, _, len) = step {
+                    batch.overlay.write(dst, len, None);
+                }
                 continue;
             }
             if profiled {
@@ -8069,6 +8090,7 @@ impl HostList {
                     batch.title_written();
                     crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    batch.overlay.write(dst, len, None);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     // What the card holds there may be another value although
@@ -8084,6 +8106,13 @@ impl HostList {
                         copies += 1;
                     }
                     crate::port::filled(src, len);
+                    // What copies at their place wrote there without title
+                    // memory taking it ([`place::Known`]).
+                    if place::serve_fills() && batch.overlay.fill(dst, src, len) {
+                        place::SERVED.fetch_add(1, Ordering::Relaxed);
+                        bytes += len as u64;
+                        continue;
+                    }
                     if wide_fills() {
                         batch.fills.push((dst, src, len));
                         bytes += len as u64;
@@ -8100,8 +8129,14 @@ impl HostList {
                     if free {
                         batch.title_written();
                     }
-                    if let Some(bytes) = p.prepare(free) {
-                        batch.placed.push((p.shadow.clone(), p.dst, bytes));
+                    let known = place::serve_fills() && p.bytes_known() && !touches(air, p.src, p.src + p.len);
+                    match p.prepare(free) {
+                        Some((bytes, true)) => {
+                            batch.overlay.write(p.dst, p.len, None);
+                            batch.placed.push((p.shadow.clone(), p.dst, bytes));
+                        }
+                        Some((bytes, false)) if !free && known => batch.overlay.write(p.dst, p.len, Some(bytes)),
+                        _ => batch.overlay.write(p.dst, p.len, None),
                     }
                     (started, p.len)
                 }
@@ -8120,6 +8155,7 @@ impl HostList {
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                        batch.overlay.clear();
                     }
                     let _step = crate::timeline::span("a step of ours");
                     work();
@@ -8420,6 +8456,9 @@ struct Batch {
     placed: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, Vec<u8>)>,
     /// Fills not done yet (destination, source, bytes): [`wide_fills`].
     fills: Vec<(usize, usize, usize)>,
+    /// What copies at their place in the submission wrote without title
+    /// memory taking it ([`place::Overlay`]).
+    overlay: place::Overlay,
     /// Copies (by address) brought up to date ahead of the steps, and the
     /// range (from, to) ([`Batch::refresh_ahead`]).
     ahead: ByCopy<(usize, usize)>,
@@ -9437,13 +9476,6 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
             });
         });
     }
-                if crate::descriptor::host::show_new_later() {
-                    tracing::info!(
-                        "slots of textures made while lists sent before them ran, shown once those had run \
-                         (SCARLETT_SHOW_NEW_LATER=1), since the start: {}",
-                        crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
-                    );
-                }
     got
 }
 
