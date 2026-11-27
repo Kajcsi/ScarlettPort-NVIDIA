@@ -24,6 +24,9 @@ pub mod runtime;
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
 pub use scarlett_gpu::console;
+/// DLSS and frame generation (`SCARLETT_DLSS`, `SCARLETT_FRAMEGEN`).
+#[cfg(windows)]
+pub use scarlett_gpu::streamline;
 /// The shader translator's fingerprint (`scarlett fingerprint`).
 pub use scarlett_gpu::shader_cache::TRANSLATOR as SHADER_TRANSLATOR;
 #[cfg(all(windows, feature = "diagnostics"))]
