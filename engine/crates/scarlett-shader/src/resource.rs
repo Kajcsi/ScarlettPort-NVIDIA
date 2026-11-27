@@ -363,7 +363,10 @@ pub fn track(
     for (block, (accesses, mut reads, loads)) in offset_at {
         reads.sort_unstable();
         reads.dedup();
-        if let Ok(proof) = t.waterfall(block, &accesses, &reads) {
+        if let Ok(proof) = t
+            .waterfall(block, &accesses, &reads)
+            .or_else(|e| t.waterfall_shape(block, &accesses, &reads, &loads).ok_or(e))
+        {
             out.waterfall.compares.extend(proof.compares);
             out.waterfall.reads.extend(proof.reads);
             out.waterfall.loads.extend(loads);
@@ -2128,6 +2131,349 @@ impl<'a> Tracer<'a> {
         Ok(out)
     }
 
+    /// Proves a single-block console waterfall over a first-lane table offset
+    /// by its exact machine/SSA shape when `waterfall` cannot prove it through
+    /// `Structured` (for example inside outer control flow where `mask_bits`
+    /// does not track the loop's EXEC equations).
+    ///
+    /// Accepts ONLY a self-looping `s_cbranch_execnz` block containing:
+    /// - `v_readfirstlane_b32` reads of loop-invariant VGPRs (under entry EXEC);
+    /// - `v_cmpx_eq_u32`/`_i32` (no modifiers) narrowing EXEC by matching each
+    ///   read with its own source VGPR;
+    /// - the descriptor table `s_load_*` instructions in `loads`;
+    /// - pure wait/nop instructions (`s_waitcnt*`, `s_nop`);
+    /// - pure read-only buffer/image loads/samples/gathers under the narrowed EXEC;
+    /// - the retry update (`s_andn2_wrexec_b64`/`_b32`, or `s_andn2_b64`/`_b32`
+    ///   followed by `s_mov_b64`/`_b32 exec, T`) on a remaining-lanes mask `T`
+    ///   whose entry values match entry `EXEC` on every non-backedge predecessor.
+    fn waterfall_shape(
+        &self,
+        b: usize,
+        accesses: &[usize],
+        reads: &[Value],
+        loads: &[Site],
+    ) -> Option<Waterfall> {
+        let block = &self.p.blocks[b];
+        let exit = block.insts.last()?;
+        if !matches!(block.exit, Exit::Branch { taken, not_taken } if taken == b && not_taken != b)
+            || exit.name() != "s_cbranch_execnz"
+            || accesses.is_empty()
+            || reads.is_empty()
+        {
+            return None;
+        }
+        let dwords: u8 = if self.p.wave64 { 2 } else { 1 };
+        let back_pos = block.preds.iter().position(|&p| p == b)?;
+        if block.preds.len() < 2 {
+            return None;
+        }
+        let exec_vals = |inst: &Inst| -> Option<[Option<Value>; 2]> {
+            let lo = inst.read(Reg::S(EXEC))?;
+            let hi = if dwords == 2 { Some(inst.read(Reg::S(EXEC + 1))?) } else { None };
+            Some([Some(lo), hi])
+        };
+        let exec_written = |inst: &Inst| -> Option<[Option<Value>; 2]> {
+            let lo = inst.write(Reg::S(EXEC))?;
+            let hi = if dwords == 2 { Some(inst.write(Reg::S(EXEC + 1))?) } else { None };
+            Some([Some(lo), hi])
+        };
+        let phi_for = |reg: Reg| block.phis.iter().find(|phi| phi.reg == reg);
+        let exec_phis = [
+            phi_for(Reg::S(EXEC))?,
+            if dwords == 2 { phi_for(Reg::S(EXEC + 1))? } else { phi_for(Reg::S(EXEC))? },
+        ];
+        let entry_exec = [
+            Some(exec_phis[0].value),
+            (dwords == 2).then_some(exec_phis[1].value),
+        ];
+
+        // Every read must live in `b` and read a loop-invariant VGPR.
+        for &r in reads {
+            let (def_b, _) = self.defs[r.0 as usize]?;
+            if def_b != b {
+                return None;
+            }
+            let src = self.first_lane_source(r)?;
+            if block.phis.iter().any(|phi| phi.value == src) {
+                return None;
+            }
+            if self.defs[src.0 as usize].is_some_and(|at| at.0 == b) {
+                return None;
+            }
+        }
+        if loads.iter().any(|&(lb, _)| lb != b) {
+            return None;
+        }
+
+        // Walk the block strictly in order:
+        // Phase 0: readfirstlane + v_cmpx_eq (narrowing EXEC)
+        // Phase 1: loads + waits + pure read-only accesses under narrowed EXEC
+        // Phase 2: retry (`s_andn2_wrexec_*` or `s_andn2_*` + `s_mov_* exec`) + `s_cbranch_execnz`
+        let mut out = Waterfall::default();
+        let mut cur_exec = entry_exec;
+        let mut narrowed = false;
+        let mut narrowed_exec = None;
+        let mut phase = 0u8;
+        let mut retry_t: Option<(u8, [Option<Value>; 2], [Option<Value>; 2])> = None;
+        let mut pending_andn2: Option<(u8, [Option<Value>; 2], [Option<Value>; 2])> = None;
+        let mut seen_accesses = 0usize;
+
+        let last_idx = block.insts.len() - 1;
+        for (i, inst) in block.insts.iter().enumerate() {
+            let name = inst.name();
+            if i == last_idx {
+                if name != "s_cbranch_execnz" || phase != 2 {
+                    return None;
+                }
+                let (_, _, retry_exec) = retry_t?;
+                if exec_vals(inst)? != retry_exec {
+                    return None;
+                }
+                break;
+            }
+
+            if name == "s_nop" || name.starts_with("s_waitcnt") {
+                continue;
+            }
+
+            // Phase 0: first-lane reads and v_cmpx_eq compares.
+            if phase == 0 && name == "v_readfirstlane_b32" {
+                let (_, w) = inst.writes.first()?;
+                if !reads.contains(w) || exec_vals(inst)? != cur_exec {
+                    return None;
+                }
+                continue;
+            }
+            if phase == 0 && matches!(name, "v_cmpx_eq_u32" | "v_cmpx_eq_i32") {
+                let Fields::Valu(f) = &inst.fields else {
+                    return None;
+                };
+                if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+                    return None;
+                }
+                if exec_vals(inst)? != cur_exec {
+                    return None;
+                }
+                let (Some(a), Some(c)) = (f.src.first(), f.src.get(1)) else {
+                    return None;
+                };
+                let match_pair = |first: &Operand, own: &Operand| -> Option<Value> {
+                    let (&Operand::Scalar { code, .. }, &Operand::Vector { reg, .. }) = (first, own) else {
+                        return None;
+                    };
+                    let Term::Value(x) = self.origin(inst.read(Reg::S(code))?) else {
+                        return None;
+                    };
+                    let lane = inst.read(Reg::V(reg))?;
+                    let (_, def_i) = self.defs[x.0 as usize]?;
+                    let same = reads.contains(&x)
+                        && def_i < i
+                        && self.lane_term(Term::Value(self.first_lane_source(x)?))
+                            == self.lane_term(Term::Value(lane));
+                    same.then_some(x)
+                };
+                let x = match_pair(a, c).or_else(|| match_pair(c, a))?;
+                cur_exec = exec_written(inst)?;
+                narrowed = true;
+                narrowed_exec = Some(cur_exec);
+                out.compares.push((b, i));
+                if !out.reads.contains(&x) {
+                    out.reads.push(x);
+                }
+                continue;
+            }
+
+            // Phase 0 -> 1 transition: table loads and read-only accesses.
+            if phase <= 1 && loads.contains(&(b, i)) {
+                if !narrowed {
+                    return None;
+                }
+                phase = 1;
+                continue;
+            }
+            let is_readonly_access = name.starts_with("buffer_load_")
+                || name.starts_with("tbuffer_load_")
+                || name.starts_with("image_load")
+                || name.starts_with("image_sample")
+                || name.starts_with("image_gather")
+                || name.starts_with("image_get_lod");
+            if phase <= 1 && is_readonly_access {
+                if !narrowed || exec_vals(inst)? != narrowed_exec? {
+                    return None;
+                }
+                phase = 1;
+                if accesses.contains(&i) {
+                    seen_accesses += 1;
+                }
+                continue;
+            }
+
+            // Phase 1 -> 2: retry instruction updating remaining lanes and EXEC.
+            let wrexec_name = if dwords == 2 { "s_andn2_wrexec_b64" } else { "s_andn2_wrexec_b32" };
+            let andn2_name = if dwords == 2 { "s_andn2_b64" } else { "s_andn2_b32" };
+            let mov_name = if dwords == 2 { "s_mov_b64" } else { "s_mov_b32" };
+
+            if phase == 1 && name == wrexec_name && pending_andn2.is_none() {
+                if exec_vals(inst)? != narrowed_exec? {
+                    return None;
+                }
+                let Fields::Sop {
+                    dst: Some(Operand::Scalar { code: t_dst, dwords: d_dst }),
+                    src,
+                    ..
+                } = &inst.fields
+                else {
+                    return None;
+                };
+                if *d_dst != dwords {
+                    return None;
+                }
+                let Some(Operand::Scalar { code: t_src, dwords: d_src }) = src.first() else {
+                    return None;
+                };
+                if *t_src != *t_dst || *d_src != dwords {
+                    return None;
+                }
+                let t_in = [
+                    Some(inst.read(Reg::S(*t_src))?),
+                    if dwords == 2 { Some(inst.read(Reg::S(*t_src + 1))?) } else { None },
+                ];
+                let t_out = [
+                    Some(inst.write(Reg::S(*t_dst))?),
+                    if dwords == 2 { Some(inst.write(Reg::S(*t_dst + 1))?) } else { None },
+                ];
+                let new_exec = exec_written(inst)?;
+                if t_in[0] != Some(phi_for(Reg::S(*t_src))?.value) {
+                    return None;
+                }
+                if dwords == 2 && t_in[1] != Some(phi_for(Reg::S(*t_src + 1))?.value) {
+                    return None;
+                }
+                retry_t = Some((*t_dst, t_out, new_exec));
+                phase = 2;
+                continue;
+            }
+
+            if phase == 1 && name == andn2_name && pending_andn2.is_none() {
+                let Fields::Sop {
+                    dst: Some(Operand::Scalar { code: t_dst, dwords: d_dst }),
+                    src,
+                    ..
+                } = &inst.fields
+                else {
+                    return None;
+                };
+                if *d_dst != dwords || src.len() < 2 {
+                    return None;
+                }
+                let (Operand::Scalar { code: s0, dwords: d0 }, Operand::Scalar { code: s1, dwords: d1 }) =
+                    (&src[0], &src[1])
+                else {
+                    return None;
+                };
+                if *s0 != *t_dst || *d0 != dwords || *s1 != EXEC || *d1 != dwords {
+                    return None;
+                }
+                if exec_vals(inst)? != narrowed_exec? {
+                    return None;
+                }
+                let t_in = [
+                    Some(inst.read(Reg::S(*s0))?),
+                    if dwords == 2 { Some(inst.read(Reg::S(*s0 + 1))?) } else { None },
+                ];
+                let t_out = [
+                    Some(inst.write(Reg::S(*t_dst))?),
+                    if dwords == 2 { Some(inst.write(Reg::S(*t_dst + 1))?) } else { None },
+                ];
+                if t_in[0] != Some(phi_for(Reg::S(*s0))?.value) {
+                    return None;
+                }
+                if dwords == 2 && t_in[1] != Some(phi_for(Reg::S(*s0 + 1))?.value) {
+                    return None;
+                }
+                pending_andn2 = Some((*t_dst, t_in, t_out));
+                continue;
+            }
+
+            if phase == 1 && name == mov_name && let Some((t_reg, _, t_out)) = pending_andn2.take() {
+                let Fields::Sop {
+                    dst: Some(Operand::Scalar { code: dst_code, dwords: d_dst }),
+                    src,
+                    ..
+                } = &inst.fields
+                else {
+                    return None;
+                };
+                let Some(Operand::Scalar { code: src_code, dwords: d_src }) = src.first() else {
+                    return None;
+                };
+                if *dst_code != EXEC || *d_dst != dwords || *src_code != t_reg || *d_src != dwords {
+                    return None;
+                }
+                let moved = [
+                    Some(inst.read(Reg::S(t_reg))?),
+                    if dwords == 2 { Some(inst.read(Reg::S(t_reg + 1))?) } else { None },
+                ];
+                if moved != t_out {
+                    return None;
+                }
+                let new_exec = exec_written(inst)?;
+                retry_t = Some((t_reg, t_out, new_exec));
+                phase = 2;
+                continue;
+            }
+
+            // Anything else inside the loop block (stores, counters, branches, ALU): refuse.
+            return None;
+        }
+
+        if phase != 2 || seen_accesses != accesses.len() || reads.iter().any(|v| !out.reads.contains(v)) {
+            return None;
+        }
+        let (t_reg, t_out, retry_exec) = retry_t?;
+
+        // Verify inductive invariant: T == EXEC on every entry edge and on the backedge.
+        for k in 0..dwords as usize {
+            let t_phi = phi_for(Reg::S(t_reg + k as u8))?;
+            let e_phi = exec_phis[k];
+            if Some(t_phi.args[back_pos]) != t_out[k] || Some(e_phi.args[back_pos]) != retry_exec[k] {
+                return None;
+            }
+            for j in 0..block.preds.len() {
+                if j == back_pos {
+                    continue;
+                }
+                if self.origin(t_phi.args[j]) != self.origin(e_phi.args[j]) {
+                    return None;
+                }
+            }
+        }
+
+        // Verify no read value escapes block `b` or is consumed outside compares/loads.
+        let allowed_sites: Vec<usize> = out
+            .compares
+            .iter()
+            .map(|&(_, idx)| idx)
+            .chain(loads.iter().map(|&(_, idx)| idx))
+            .collect();
+        for (ob, other) in self.p.blocks.iter().enumerate() {
+            for phi in &other.phis {
+                if phi.args.iter().any(|a| reads.contains(a)) {
+                    return None;
+                }
+            }
+            for (oi, inst) in other.insts.iter().enumerate() {
+                if inst.reads.iter().any(|&(_, v)| reads.contains(&v))
+                    && (ob != b || !allowed_sites.contains(&oi))
+                {
+                    return None;
+                }
+            }
+        }
+
+        Some(out)
+    }
+
     /// Consecutive dwords of one scalar load.
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
@@ -3380,6 +3726,26 @@ pub(crate) mod tests {
         assert_eq!(r.waterfall.compares.len(), 1);
         assert_eq!(r.waterfall.reads.len(), 1);
         assert_eq!(r.waterfall.loads, [load]);
+
+        // Verify `waterfall_shape` independently proves the same console waterfall
+        // directly from its SSA/machine shape (used as fallback when `Structured`
+        // cannot track EXEC through outer control flow).
+        let bytes: Vec<u8> = WATERFALL_INDEXED_WAVE32.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&bytes, false, 32).unwrap();
+        let layout = [param(Table, 0, 1), param(Table, 1, 1)];
+        let t = Tracer::new(&p, &layout, HwStage::Cs, None).unwrap();
+        let (loop_b, load_i) = load;
+        let access_i = p.blocks[loop_b]
+            .insts
+            .iter()
+            .position(|inst| inst.name().starts_with("image_sample"))
+            .unwrap();
+        let proof = t
+            .waterfall_shape(loop_b, &[access_i], &r.waterfall.reads, &[load])
+            .expect("waterfall_shape should prove WATERFALL_INDEXED_WAVE32");
+        assert_eq!(proof.compares, r.waterfall.compares);
+        assert_eq!(proof.reads, r.waterfall.reads);
+        assert_eq!(load_i, load.1);
     }
 
     /// [`WATERFALL_JOINED_WAVE32`] with other sources on each path: lanes
