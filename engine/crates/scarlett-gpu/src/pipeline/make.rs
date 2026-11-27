@@ -343,10 +343,102 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
             // here: the shared frame budget must not discard a one-time write.
             p.make();
         } else {
-            wait(p, crate::frame::current());
+            let frame = crate::frame::current();
+            match (p.graphics.is_none() && compute_waits()).then(|| compute_deadline(frame)).flatten() {
+                // (A worker makes it: requested pipelines go before all but the
+                // passes over the screen.)
+                Some(deadline) => wait_until(p, deadline),
+                None => wait(p, frame),
+            }
         }
     }
     p.made.get()?.as_ref()
+}
+
+/// (Vilocity: Exopus's, DoubleGhosty/cool_fox 2a1965f, GPL-3.0, as this.)
+/// Whether a dispatch waits for its compute pipeline until it is made,
+/// whatever the frame's budget ([`wait_budget`]); a draw still waits within
+/// the budget and is dropped while its pipeline is not there.
+///
+/// A dropped draw is drawn again in the next frame. A dropped dispatch may
+/// not be: the title runs some compute passes once (a bake of a character's
+/// clothes and skin, a buffer cleared when a scene changes), and what they
+/// leave is read for as long as the scene lasts. Seen here: the shirt of the
+/// character in blocks of black and white, his arms speckled, after a start
+/// in which pipelines were still being made. A wait once (the pipeline
+/// library has it on the next run) against a picture wrong until the scene
+/// ends. On by default; `SCARLETT_PIPELINE_COMPUTE_WAIT=0`: within the
+/// budget, as before.
+fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SCARLETT_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
+}
+
+/// For how long, from a frame's first dispatch that waits so on
+/// ([`compute_waits`]), the frame's dispatches wait for their pipelines
+/// whatever the budget (`SCARLETT_PIPELINE_COMPUTE_WAIT_MS`, 12 s). After
+/// that they wait within the budget like draws, and are dropped while their
+/// pipeline is not there.
+///
+/// Without an end the first frame of the world, on a PC that never ran the
+/// game, made every compute pipeline it uses one after the other on the
+/// title's own thread: that frame stood 30 s and the title's watchdog ended
+/// the run with a write to address 0 (issue 1, an RTX 5070 Ti). The waits
+/// are for the workers, up to the frame's deadline, and not for a compile on
+/// the title's thread, which cannot be cut short: one pipeline took 16 s to
+/// make here (a 9950X3D, after a new translation), more on a slower processor.
+/// 12 s, with the 10 s of the passes over the screen and the half second of
+/// the others, stay below the watchdog's 30. What a dropped dispatch leaves
+/// wrong (see [`compute_waits`]) is right on the next start, when the
+/// pipelines are there.
+fn compute_wait_most() -> Duration {
+    static MOST: OnceLock<Duration> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let millis = std::env::var("SCARLETT_PIPELINE_COMPUTE_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12_000);
+        Duration::from_millis(millis)
+    })
+}
+
+/// Until when `frame`'s dispatches wait for their pipelines whatever the
+/// budget ([`compute_wait_most`]); `None` once that is past.
+fn compute_deadline(frame: u64) -> Option<Instant> {
+    static BEGAN: Mutex<(u64, Option<Instant>)> = Mutex::new((u64::MAX, None));
+    let deadline = deadline_of(&mut BEGAN.lock().unwrap_or_else(|e| e.into_inner()), frame, Instant::now(), compute_wait_most());
+    if deadline.is_none() {
+        static SAID: AtomicU64 = AtomicU64::new(u64::MAX);
+        if SAID.swap(frame, Ordering::Relaxed) != frame {
+            tracing::warn!(
+                frame,
+                "compute pipelines were still being made after {} s of one frame: its other dispatches wait within the budget, and what \
+                 they would have made may be missing until the game is started again (SCARLETT_PIPELINE_COMPUTE_WAIT_MS)",
+                compute_wait_most().as_secs()
+            );
+        }
+    }
+    deadline
+}
+
+/// Of [`compute_deadline`]: `began` holds the frame last asked about and when
+/// its first asking was; that time plus `most`, if `now` is before it.
+fn deadline_of(began: &mut (u64, Option<Instant>), frame: u64, now: Instant, most: Duration) -> Option<Instant> {
+    if began.0 != frame || began.1.is_none() {
+        *began = (frame, Some(now));
+    }
+    let end = began.1? + most;
+    (now < end).then_some(end)
+}
+
+/// Waits until `p` is made or `deadline` has passed.
+fn wait_until(p: &Pending, deadline: Instant) {
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let rest = deadline.saturating_duration_since(Instant::now());
+        if rest.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -689,6 +781,36 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame's dispatches wait for their pipelines until a deadline set at
+    /// its first such wait, and a new frame begins anew.
+    #[test]
+    fn a_frame_has_a_deadline_for_dispatches_to_wait() {
+        let most = Duration::from_secs(12);
+        let t0 = Instant::now();
+        let mut began = (u64::MAX, None);
+        let end = Some(t0 + most);
+        assert_eq!(deadline_of(&mut began, 7, t0, most), end);
+        assert_eq!(deadline_of(&mut began, 7, t0 + Duration::from_secs(11), most), end, "the same deadline all frame");
+        assert_eq!(deadline_of(&mut began, 7, t0 + Duration::from_secs(12), most), None);
+        assert_eq!(deadline_of(&mut began, 7, t0 + Duration::from_secs(40), most), None);
+        let t1 = t0 + Duration::from_secs(41);
+        assert_eq!(deadline_of(&mut began, 8, t1, most), Some(t1 + most));
+        assert_eq!(deadline_of(&mut began, 8, t0 + Duration::from_secs(53), most), None);
+        // No time at all: never.
+        assert_eq!(deadline_of(&mut (u64::MAX, None), 1, t0, Duration::ZERO), None);
+    }
+
+    /// The wait ends at its deadline, however long the pipeline takes.
+    #[test]
+    fn a_wait_for_a_pipeline_ends_at_its_deadline() {
+        let p = Pending::new(Vec::new(), None);
+        let began = Instant::now();
+        wait_until(&p, began + Duration::from_millis(60));
+        let waited = began.elapsed();
+        assert!(p.made.get().is_none());
+        assert!(waited >= Duration::from_millis(60) && waited < Duration::from_secs(2), "{waited:?}");
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
