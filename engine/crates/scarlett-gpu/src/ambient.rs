@@ -281,6 +281,8 @@ const SOURCE: &str = r#"
 #define CELLS (CX * CY)
 #define PX 160
 #define PY 90
+// Where the points' distances are in `points` (after three a point).
+#define DEPTHS (3 * PX * PY)
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
@@ -383,6 +385,8 @@ void gather(uint3 at : SV_DispatchThreadID) {
     points[at0] = float4(red / whole - light.r * toward, light.r);
     points[at0 + 1] = float4(green / whole - light.g * toward, light.g);
     points[at0 + 2] = float4(blue / whole - light.b * toward, light.b);
+    // Its distance, after the three of every point (for the air's bound).
+    points[DEPTHS + at.y * PX + at.x] = float4(p.z, 0.0, 0.0, 0.0);
 }
 #endif
 
@@ -390,16 +394,39 @@ void gather(uint3 at : SV_DispatchThreadID) {
 RWTexture3D<float3> scattered : register(u0);
 // No more than a multiple of the light around: of the room as the last
 // seconds showed it, and of the surface seen in this direction (towards a
-// window the air outside may be as bright as the sky is).
+// window the air outside may be as bright as the sky is). That surface is
+// the one behind the air: of the four points around the column, those as
+// far as the farthest of them, between them as they lie. Taken from the
+// nearest point whatever its distance, a lit figure in front of a dark wall
+// let the lamps' light into the air behind it in blocks of the volume's
+// columns around the figure (red steps around people in a bar, scar13).
 [RootSignature(RS)]
 [numthreads(8, 8, 2)]
 void clear_air(uint3 at : SV_DispatchThreadID) {
     uint w, h, d;
     scattered.GetDimensions(w, h, d);
     if (at.x >= w || at.y >= h || at.z >= d) return;
-    uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
-    uint at0 = (q.y * PX + q.x) * 3;
-    float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+    float2 g = (float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY) - 0.5;
+    int2 g0 = int2(floor(g));
+    float2 f = g - float2(g0);
+    float zk[4];
+    float back = 0.0;
+    for (int k = 0; k < 4; k++) {
+        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+        zk[k] = points[DEPTHS + q.y * PX + q.x].x;
+        back = max(back, zk[k]);
+    }
+    float3 seen_there = 0.0;
+    float sum = 0.0;
+    for (int k = 0; k < 4; k++) {
+        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+        float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+        float wgt = (b.x * b.y + 1e-3) * (zk[k] >= 0.7 * back ? 1.0 : 1e-3);
+        uint at0 = (q.y * PX + q.x) * 3;
+        seen_there += wgt * float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+        sum += wgt;
+    }
+    seen_there /= max(sum, 1e-6);
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
@@ -584,7 +611,8 @@ void raise(uint3 at : SV_DispatchThreadID) {
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
 const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
-const POINT_BYTES: u64 = 160 * 90 * 48;
+/// Three float4 a point, then one more a point for its distance.
+const POINT_BYTES: u64 = 160 * 90 * 64;
 
 struct Pass {
     root: ID3D12RootSignature,
