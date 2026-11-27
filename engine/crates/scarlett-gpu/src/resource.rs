@@ -3212,8 +3212,6 @@ fn forget_placed() {
             let keys = placed_in(&map, &ranges);
             keys.into_iter().filter_map(|key| map.remove(&key)).collect()
         };
-        // (The filler-twin statistics: diagnostics builds only.)
-        #[cfg(feature = "diagnostics")]
         {
             let mut raw = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
             let keys: Vec<(u64, [u32; 14])> = ranges
@@ -5315,10 +5313,10 @@ float4 lit() : SV_Target { return 1.0; }
             if state != tested {
                 l.ResourceBarrier(&[moved(host_depth, state, tested)]);
             }
-            l.ClearRenderTargetView(colour.handle, &[0.0; 4], None);
+            l.ClearRenderTargetView(colour, &[0.0; 4], None);
             l.SetGraphicsRootSignature(&signature);
             l.SetPipelineState(&pipeline);
-            l.OMSetRenderTargets(1, Some(&colour.handle), false, Some(&depth_view.handle));
+            l.OMSetRenderTargets(1, Some(&colour), false, Some(&depth_view));
             l.RSSetViewports(&[D3D12_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,

@@ -25,46 +25,6 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
-/// Whether `depth` is the depth plane of the subresources `stencil` shows
-/// the stencil plane of: one texture (or one the title placed), a 2D view of
-/// plane 1 in X32_TYPELESS_G8X24_UINT or X24_TYPELESS_G8_UINT against a 2D
-/// view of plane 0 in the matching depth format, the same levels and array
-/// slice, default component order.
-///
-/// After TaynanGT/Vice-Tay PR 206 (Taynan Piza, GPL-3.0-or-later, reported by
-/// Garu667): the diffuse resolve can bind its depth's stencil plane at the
-/// usual place, and the depth view it reads elsewhere is the one to use.
-fn is_depth_companion(stencil: &View, depth: &View) -> bool {
-    use windows::Win32::Graphics::Dxgi::Common::{
-        DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, DXGI_FORMAT_X24_TYPELESS_G8_UINT,
-        DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
-    };
-    let (stencil_desc, depth_desc): (&[u32], &[u32]) = match (stencil, depth) {
-        (View::Shader(a, Some(stencil)), View::Shader(b, Some(depth))) if a == b && *a != 0 => (stencil, depth),
-        (View::Placed(false, _, stencil_desc), View::Placed(false, _, depth_desc))
-            if crate::descriptor::host::same_placed_texture(stencil, depth) =>
-        {
-            (stencil_desc, depth_desc)
-        }
-        _ => return false,
-    };
-    let format = |view: &[u32]| DXGI_FORMAT(crate::resource::pc_format(view[0]) as i32);
-    let expected = match format(stencil_desc) {
-        DXGI_FORMAT_X32_TYPELESS_G8X24_UINT => DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
-        DXGI_FORMAT_X24_TYPELESS_G8_UINT => DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
-        _ => return false,
-    };
-    let texture_2d = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
-    stencil_desc[1] == texture_2d
-        && depth_desc[1] == texture_2d
-        && stencil_desc[6] == 1
-        && depth_desc[6] == 0
-        && format(depth_desc) == expected
-        && depth_desc[2] == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
-        && stencil_desc[4..6] == depth_desc[4..6]
-        && stencil_desc[7] == depth_desc[7]
-}
-
 /// Shader interface metadata shared by every pipeline variant and draw.
 pub(crate) struct TablePlan {
     groups: Vec<TableGroup>,
@@ -596,10 +556,6 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, host heap id, first,
     /// count; given back when the list has run, is reset or released.
     dynamic: Vec<(usize, u64, u32, u32)>,
-    /// Dynamic slots reserved for this list in one taking of the heap's lock
-    /// and handed to its tables from here: (title heap, host heap id, first,
-    /// count, used) (`SCARLETT_DYNAMIC_SLAB`).
-    slab: Option<(usize, u64, u32, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -614,20 +570,8 @@ pub(crate) struct State {
     recording: u64,
 }
 
-/// Whether a list reserves its tables' dynamic slots in slabs of
-/// [`DYNAMIC_SLAB`] (`SCARLETT_DYNAMIC_SLAB`, on; `0`: the heap's lock taken
-/// for every table). After ToLIManl/VIctory-Hydra (GPL-3.0-or-later).
-fn dynamic_slab_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SCARLETT_DYNAMIC_SLAB").is_none_or(|v| v != "0"))
-}
-
-/// Dynamic slots a list reserves at a time.
-const DYNAMIC_SLAB: u32 = 256;
-
 impl Drop for State {
     fn drop(&mut self) {
-        self.flush_slab();
         for &(heap, id, first, n) in &self.dynamic {
             crate::descriptor::release_dynamic(heap, id, first, n);
         }
@@ -635,49 +579,6 @@ impl Drop for State {
 }
 
 impl State {
-    /// The slab's used slots become the list's; the rest go back to the heap.
-    fn flush_slab(&mut self) {
-        if let Some((heap, id, first, len, used)) = self.slab.take() {
-            if used > 0 {
-                self.dynamic.push((heap, id, first, used));
-            }
-            if used < len {
-                crate::descriptor::release_dynamic(heap, id, first + used, len - used);
-            }
-        }
-    }
-
-    /// `n` consecutive dynamic slots of `host` (the host heap of the title
-    /// heap `heap`) for this list, from its slab when there is room there;
-    /// the first's index. Taken until the list's tables are done.
-    fn alloc_dynamic(&mut self, heap: usize, host: &crate::descriptor::host::HostHeap, n: u32) -> Option<u32> {
-        let id = host.id();
-        if dynamic_slab_on() && n > 0 {
-            if let Some((h, i, first, len, used)) = &mut self.slab
-                && *h == heap
-                && *i == id
-                && used.checked_add(n).is_some_and(|end| end <= *len)
-            {
-                let at = *first + *used;
-                *used += n;
-                return Some(at);
-            }
-            self.flush_slab();
-            let (first, got) = host.dynamic_slab(n, DYNAMIC_SLAB).or_else(|| {
-                crate::host::settle_for_fence();
-                host.dynamic_slab(n, DYNAMIC_SLAB)
-            })?;
-            self.slab = Some((heap, id, first, got, n));
-            return Some(first);
-        }
-        let first = host.dynamic(n).or_else(|| {
-            crate::host::settle_for_fence();
-            host.dynamic(n)
-        })?;
-        self.dynamic.push((heap, id, first, n));
-        Some(first)
-    }
-
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -686,7 +587,6 @@ impl State {
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
-        self.flush_slab();
         if self.tables_gone && self.dynamic.is_empty() {
             return;
         }
@@ -822,26 +722,10 @@ fn heap_spread() -> bool {
     *ON.get_or_init(|| std::env::var_os("SCARLETT_HEAP_SPREAD").is_none_or(|v| v != "0"))
 }
 
-/// Sentinel in [`HeapRanges::index`] for slots with no active buffer range.
-const EMPTY_RANGE_POS: u32 = u32::MAX;
-
 /// The host copy and range the buffer view of each of a heap's slots reads
-/// ([`State::heap_buffers`]), packed densely per `slot % HEAP_ROUND` bucket so
-/// iterating active ranges never walks hundreds of thousands of empty slots and
-/// `forget_part` clears one contiguous bucket directly.
-struct HeapRanges<T> {
-    parts: [Vec<(u32, (T, u64, u64))>; HEAP_ROUND as usize],
-    index: Vec<u32>,
-}
-
-impl<T> Default for HeapRanges<T> {
-    fn default() -> Self {
-        Self {
-            parts: std::array::from_fn(|_| Vec::new()),
-            index: Vec::new(),
-        }
-    }
-}
+/// ([`State::heap_buffers`]), by slot.
+#[derive(Default)]
+struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>);
 
 /// Descriptor-derived references belong to the heap that produced them.
 pub(crate) struct BufferSweep {
@@ -849,102 +733,34 @@ pub(crate) struct BufferSweep {
     ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
-    // Size hint from the previous pass to avoid repeated `ByCopy` rehashes.
-    last_spans: usize,
 }
 
 impl Default for BufferSweep {
     fn default() -> Self {
-        Self {
-            passes: 0,
-            ranges: HeapRanges::default(),
-            unwatched: Default::default(),
-            last_spans: 0,
-        }
+        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
     }
 }
 
 impl<T> HeapRanges<T> {
-    fn clear(&mut self) {
-        for bucket in &mut self.parts {
-            for &(slot, _) in bucket.iter() {
-                self.index[slot as usize] = EMPTY_RANGE_POS;
-            }
-            bucket.clear();
-        }
-    }
-
-    #[cfg(test)]
-    fn get(&self, slot: u32) -> Option<&(T, u64, u64)> {
-        let pos = self.index.get(slot as usize).copied().unwrap_or(EMPTY_RANGE_POS);
-        if pos == EMPTY_RANGE_POS {
-            None
-        } else {
-            Some(&self.parts[(slot as usize) % (HEAP_ROUND as usize)][pos as usize].1)
-        }
-    }
-
     fn set(&mut self, slot: u32, range: Option<(T, u64, u64)>) {
-        let idx = slot as usize;
-        let bucket = &mut self.parts[idx % (HEAP_ROUND as usize)];
-        let pos = self.index.get(idx).copied().unwrap_or(EMPTY_RANGE_POS);
-        match range {
-            Some(value) => {
-                if pos != EMPTY_RANGE_POS {
-                    bucket[pos as usize].1 = value;
-                } else {
-                    if idx >= self.index.len() {
-                        self.index.resize(idx + 1, EMPTY_RANGE_POS);
-                    }
-                    self.index[idx] = bucket.len() as u32;
-                    bucket.push((slot, value));
-                }
-            }
-            None => {
-                if pos != EMPTY_RANGE_POS {
-                    let pos = pos as usize;
-                    self.index[idx] = EMPTY_RANGE_POS;
-                    bucket.swap_remove(pos);
-                    if let Some(&(moved_slot, _)) = bucket.get(pos) {
-                        self.index[moved_slot as usize] = pos as u32;
-                    }
-                }
-            }
+        let slot = slot as usize;
+        if range.is_none() && slot >= self.0.len() {
+            return;
         }
+        if slot >= self.0.len() {
+            self.0.resize_with(slot + 1, || None);
+        }
+        self.0[slot] = range;
     }
 
     /// Forgets the slots of one of `parts` parts
     /// (`HostHeap::buffer_slots_of`).
     fn forget_part(&mut self, part: u32, parts: u32) {
-        if parts == HEAP_ROUND as u32 {
-            let bucket = &mut self.parts[part as usize];
-            for &(slot, _) in bucket.iter() {
-                self.index[slot as usize] = EMPTY_RANGE_POS;
-            }
-            bucket.clear();
-            return;
-        }
-        for bucket in &mut self.parts {
-            let mut i = 0;
-            while i < bucket.len() {
-                if bucket[i].0 % parts == part {
-                    let slot = bucket[i].0;
-                    self.index[slot as usize] = EMPTY_RANGE_POS;
-                    bucket.swap_remove(i);
-                    if let Some(&(moved_slot, _)) = bucket.get(i) {
-                        self.index[moved_slot as usize] = i as u32;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-        }
+        self.0.iter_mut().skip(part as usize).step_by(parts as usize).for_each(|r| *r = None);
     }
 
     fn ranges(&self) -> impl Iterator<Item = &(T, u64, u64)> {
-        self.parts
-            .iter()
-            .flat_map(|bucket| bucket.iter().map(|(_, range)| range))
+        self.0.iter().flatten()
     }
 }
 
@@ -996,7 +812,7 @@ mod heap_range_tests {
     #[test]
     fn every_slot_is_looked_at_again_in_a_round() {
         const SLOTS: u32 = 1000;
-        let mut ranges = HeapRanges::default();
+        let mut ranges = HeapRanges(Vec::new());
         ranges.set(7, None);
         assert_eq!(ranges.ranges().count(), 0);
         for slot in (0..SLOTS).step_by(3) {
@@ -1007,7 +823,7 @@ mod heap_range_tests {
             let part = (pass % HEAP_ROUND) as u32;
             ranges.forget_part(part, parts);
             for slot in (0..SLOTS).step_by(3).filter(|slot| slot % parts == part) {
-                assert!(ranges.get(slot).is_none(), "slot {slot} not forgotten");
+                assert!(ranges.0[slot as usize].is_none(), "slot {slot} not forgotten");
                 ranges.set(slot, Some(((), pass, pass)));
             }
             assert_eq!(ranges.ranges().count(), SLOTS.div_ceil(3) as usize);
@@ -1015,9 +831,6 @@ mod heap_range_tests {
         assert!(ranges.ranges().all(|r| r.1 != 0), "a slot not looked at in a round");
         ranges.set(3, None);
         assert_eq!(ranges.ranges().count(), SLOTS.div_ceil(3) as usize - 1);
-        ranges.clear();
-        assert_eq!(ranges.ranges().count(), 0);
-        assert!(ranges.get(0).is_none());
     }
 
     /// The spans of 4,400 copies from the ranges of 72,000 slots, as a pass
@@ -1029,11 +842,9 @@ mod heap_range_tests {
         use std::collections::HashMap;
         use std::sync::Arc;
         let copies: Vec<Arc<u64>> = (0..4400).map(Arc::new).collect();
-        let (mut table, mut slots) = (HashMap::new(), HeapRanges::default());
-        for i in 0..72_000u32 {
-            // Spread across a realistic ~720k-slot view heap.
-            let slot = i * 10;
-            let copy = &copies[i as usize * 7919 % 4400];
+        let (mut table, mut slots) = (HashMap::new(), HeapRanges(Vec::new()));
+        for slot in 0..72_000u32 {
+            let copy = &copies[slot as usize * 7919 % 4400];
             table.insert(slot, (copy.clone(), u64::from(slot), u64::from(slot) + 64));
             slots.set(slot, Some((copy.clone(), u64::from(slot), u64::from(slot) + 64)));
         }
@@ -1334,11 +1145,11 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // released resource goes stale without a write, and a slot written
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
-    let BufferSweep { passes, ranges, unwatched, last_spans } = &mut *kept;
+    let BufferSweep { passes, ranges, unwatched } = &mut *kept;
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
-        ranges.clear();
+        ranges.0.clear();
         host.buffer_slots()
     } else if heap_spread() {
         // The written ones, and this pass's part of the others.
@@ -1389,21 +1200,21 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
     crate::land::each_view(false, parts.len(), &|n| {
         let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
+        // (After each piece while the device lives: a cheap query.)
+        if alive
+            && let Some(why) = crate::descriptor::host::device_removed()
+            && !GONE.swap(true, Ordering::Relaxed)
+        {
+            let last: Vec<String> = parts[n]
+                .iter()
+                .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                .map(|s| s.chars().take(200).collect())
+                .collect();
+            tracing::error!(why, "the host device went while buffer views of the heap were made; perhaps one of: {last:#?}");
+            crate::host::log_removal_context();
+        }
         let _ = found[n].set(looked);
     });
-    if alive
-        && let Some(why) = crate::descriptor::host::device_removed()
-        && !GONE.swap(true, Ordering::Relaxed)
-    {
-        let last: Vec<String> = slots
-            .iter()
-            .take(64)
-            .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
-            .map(|s| s.chars().take(200).collect())
-            .collect();
-        tracing::error!(why, "the host device went while buffer views of the heap were made; perhaps one of: {last:#?}");
-        crate::host::log_removal_context();
-    }
     for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
         let range = shows.map(|(range, written)| {
             if written {
@@ -1419,8 +1230,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
     // Per host copy, the span its picked views cover.
-    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-        std::collections::HashMap::with_capacity_and_hasher(*last_spans, Default::default());
+    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
     let mut views = 0u32;
     for (shadow, from, to) in ranges.ranges() {
         views += 1;
@@ -1429,8 +1239,6 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         span.1 = span.1.min(*from);
         span.2 = span.2.max(*to);
     }
-    let copy_count = spans.len();
-    *last_spans = copy_count;
     let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
@@ -1443,33 +1251,22 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let every = *EVERY.get_or_init(|| {
         std::env::var("SCARLETT_UNWATCHED_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
     });
-    let mut found = Vec::with_capacity(copy_count);
-    if every <= 1 {
-        if !unwatched.is_empty() {
-            unwatched.clear();
-        }
-        for (shadow, from, to) in spans.into_values() {
-            let clamped = to.min(from + shadow.left(from));
-            found.push((shadow, from, clamped));
-        }
-    } else {
-        let mut next_unwatched = std::collections::HashMap::with_capacity(unwatched.len());
-        for (shadow, from, to) in spans.into_values() {
-            if shadow.unwatched() {
-                let id = shadow.id();
-                if let Some(&(last, low, high)) = unwatched.get(&id)
-                    && frame >= last && frame - last < every && low <= from && to <= high
-                {
-                    next_unwatched.insert(id, (last, low, high));
-                    continue;
-                }
-                next_unwatched.insert(id, (frame, from, to));
+    let mut found = Vec::with_capacity(spans.len());
+    let mut next_unwatched = std::collections::HashMap::new();
+    for (shadow, from, to) in spans.values() {
+        if every > 1 && shadow.unwatched() {
+            let id = shadow.id();
+            if let Some(&(last, low, high)) = unwatched.get(&id)
+                && frame >= last && frame - last < every && low <= *from && *to <= high
+            {
+                next_unwatched.insert(id, (last, low, high));
+                continue;
             }
-            let clamped = to.min(from + shadow.left(from));
-            found.push((shadow, from, clamped));
+            next_unwatched.insert(id, (frame, *from, *to));
         }
-        *unwatched = next_unwatched;
+        found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
     }
+    *unwatched = next_unwatched;
     drop(kept);
     #[cfg(feature = "diagnostics")]
     let refreshed = std::time::Instant::now();
@@ -1486,7 +1283,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         tracing::info!(
             slots = slots.len(),
             views,
-            copies = copy_count,
+            copies = spans.len(),
             mb = bytes >> 20,
             ms = started.elapsed().as_millis(),
             "buffer views of the heap made ready for shaders that pick them by index"
@@ -1652,12 +1449,9 @@ impl State {
             return;
         }
         self.host_targets = Some(now);
-        // Held until the targets are recorded below ([`crate::host::HeldView`]).
-        let held: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
-        let held_dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
-        let rtvs: Vec<_> = held.iter().map(|view| view.handle).collect();
-        let dsv = held_dsv.as_ref().map(|view| view.handle);
-        // SAFETY: an open list; the views were just made and are held.
+        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
+        let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
+        // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
                 rtvs.len() as u32,
@@ -2371,14 +2165,12 @@ impl State {
             }
             Some(s)
         };
-        #[cfg(feature = "diagnostics")]
-        let pipeline = self.pipeline;
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
                 #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(a, len, pipeline);
+                crate::host::wide_write(a, len, self.pipeline);
                 s.gpu_writes(list, a, len);
             }
         };
@@ -2415,9 +2207,13 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = self.alloc_dynamic(key.0, host, 1) else {
+                let Some(index) = host.dynamic(1).or_else(|| {
+                    crate::host::settle_for_fence();
+                    host.dynamic(1)
+                }) else {
                     return false;
                 };
+                self.dynamic.push((key.0, host.id(), index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -2485,9 +2281,13 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = self.alloc_dynamic(key.0, host, 1) else {
+                let Some(index) = host.dynamic(1).or_else(|| {
+                    crate::host::settle_for_fence();
+                    host.dynamic(1)
+                }) else {
                     return false;
                 };
+                self.dynamic.push((key.0, host.id(), index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -4046,35 +3846,8 @@ impl State {
         // walls of rooms black, as the title has them without rays (and the
         // probes' old memory in blocks).
         let mut flat = false;
-        // Where the usual place names a stencil plane, the depth plane of the
-        // same texture the dispatch reads at another place (Vice-Tay PR 206),
-        // before any depth of the picture's size: that may be another one.
-        let view_at = |(slot, offset): (u8, u32)| {
-            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
-                return None;
-            };
-            crate::descriptor::view(table.checked_add(u64::from(offset) * 4)?)
-        };
-        let companion = |at: (u8, u32)| {
-            let stencil = view_at(at)?;
-            t.used
-                .iter()
-                .filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Table)
-                .map(|u| (u.slot, u.table_offset_dwords))
-                .filter(|place| *place != at)
-                .find(|place| view_at(*place).is_some_and(|depth| is_depth_companion(&stencil, &depth)))
-                .and_then(|place| entry(ResourceType::Srv, place))
-        };
         let depth = match role {
             Role::Resolve => usual_depth(DEPTH)
-                .or_else(|| {
-                    let found = companion(DEPTH);
-                    static COMPANION: AtomicU64 = AtomicU64::new(0);
-                    if found.is_some() && COMPANION.fetch_add(1, Ordering::Relaxed) == 0 {
-                        tracing::info!(target: "scarlett_gpu::ambient", "the diffuse stand-in takes the depth plane of the stencil view at its usual place (counted once)");
-                    }
-                    found
-                })
                 .or_else(|| {
                     let size = image.as_ref().map(|(d, _)| (d.Width, d.Height));
                     scan(ResourceType::Srv, &|d| depth_like(d) && size == Some((d.Width, d.Height)))
@@ -4795,13 +4568,18 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = self.alloc_dynamic(std::ptr::from_ref(heap) as usize, host, n) else {
+            let Some(first) = host.dynamic(n).or_else(|| {
+                crate::host::settle_for_fence();
+                host.dynamic(n)
+            }) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
                 continue;
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            self.dynamic
+                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + own_count <= host.count());
@@ -6110,21 +5888,6 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 mod tests {
     use super::{AfterLook, after_unchanged_look, next_texture_recheck, staging_budget_per_frame};
 
-    #[test]
-    fn the_reported_stencil_view_requires_its_matching_depth_plane() {
-        use super::{View, is_depth_companion};
-        let words = [22, 4, 5768, 0, 0, 1, 1, 0, 0, 0];
-        let stencil = View::Shader(1, Some(words));
-        let mut depth = words;
-        depth[0] = 21;
-        depth[6] = 0;
-        assert!(!is_depth_companion(&stencil, &stencil));
-        assert!(is_depth_companion(&stencil, &View::Shader(1, Some(depth))));
-        assert!(!is_depth_companion(&stencil, &View::Shader(2, Some(depth))));
-        depth[4] = 1;
-        assert!(!is_depth_companion(&stencil, &View::Shader(1, Some(depth))));
-    }
-
     /// A texture whose memory is shown at other addresses too is looked at
     /// for as long as it stays, parked between its looks at the longest wait;
     /// whether it is shown elsewhere is asked only when its looks would end.
@@ -6304,9 +6067,6 @@ mod shared_table_tests {
         let p = state.tables_with_extents(&list, &ps, false, &extents);
         assert_eq!(&*v, &*p);
         assert_ne!(v[0].1, u32::MAX);
-        // (With `SCARLETT_DYNAMIC_SLAB` the slots sit in the list's slab
-        // until it is flushed: its used ones then become the list's.)
-        state.flush_slab();
         assert_eq!(state.dynamic.len(), 1);
         assert_eq!(state.dynamic[0].3, 128);
 
