@@ -374,6 +374,9 @@ pub(crate) struct Shadow {
     elide: AtomicU8,
     /// What the watching has seen of uploads and fetches.
     elide_track: Mutex<elide::Tracker>,
+    /// Whether its title memory is write-combined ([`Shadow::write_combined`],
+    /// `SCARLETT_WC_NO_BACK`): 0 not known yet, 1 no, 2 yes.
+    wc: AtomicU8,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -2533,6 +2536,101 @@ fn land_echo() -> bool {
 /// bytes a landing was noted in that were the title's too.
 pub(crate) static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+// Write-combined title memory without write-back (`SCARLETT_WC_NO_BACK`). Ported from
+// trustno1-coder/VIctory-NVIDIA 50c15a1 and 2f81d0c (readmet3xt-lab, the foxhound base; GPL-3.0, as
+// this); its mapped-copy half (SCARLETT_WC_BAR) is not ported.
+
+/// Title memory the title asked for write-combined (the console's 0x400
+/// protection bit), as `[start, end)` ([`title_memory_write_combined`]).
+static WRITE_COMBINED: RwLock<Vec<(u64, u64)>> = RwLock::new(Vec::new());
+
+/// The title asked for `[at, at + len)` write-combined: its CPU writes the
+/// memory and does not read it (reads of such memory are uncached on the
+/// console; the results the title reads back go to cacheable memory).
+pub fn title_memory_write_combined(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut all = WRITE_COMBINED.write().unwrap_or_else(|e| e.into_inner());
+    all.push((at as u64, (at + len) as u64));
+}
+
+/// The title let go of `[at, at + len)` (`len` 0: of the allocation at `at`):
+/// write-combined regions in it are forgotten.
+pub(crate) fn write_combined_freed(at: usize, len: usize) {
+    let (at, end) = (at as u64, at.saturating_add(len) as u64);
+    let mut all = WRITE_COMBINED.write().unwrap_or_else(|e| e.into_inner());
+    if all.is_empty() {
+        return;
+    }
+    all.retain(|&(from, to)| if len == 0 { from != at } else { to <= at || from >= end });
+}
+
+/// Whether all of `[start, start + len)` lies in write-combined title memory
+/// (in one region the title asked for so: regions are hundreds of MB to GB).
+fn is_write_combined(start: u64, len: u64) -> bool {
+    let all = WRITE_COMBINED.read().unwrap_or_else(|e| e.into_inner());
+    all.iter().any(|&(from, to)| from <= start && start + len <= to)
+}
+
+/// Whether what shaders write into copies in the card's memory of
+/// write-combined title memory, of [`wc_no_back_min`] bytes or more, stays on
+/// the card and is not compared, fetched and landed in title memory
+/// (`SCARLETT_WC_NO_BACK=1`; off by default: it can change the picture.
+/// `SCARLETT_AB=<s>,SCARLETT_WC_NO_BACK` turns it on and off while the title
+/// runs).
+///
+/// The write-back of shader writes (`Shadow::gpu_writes`: hashes after sends,
+/// compare passes after the lists, fetches of the pieces that differ and
+/// their landing) keeps title memory the newest for the title's CPU. In the
+/// source fork's gameplay frame seven of the eight largest compared ranges,
+/// about 360 of 730 MB a frame, lay in the title's write-combined memory
+/// (protection 0x2404: 2.2 and 3.2 GB), and 36 MB a frame of it came back.
+/// Measured there (RTX 4070 SUPER, with `_MIN_KB=1024`, runs xd-base-b and
+/// xd-wc1m): gameplay 38.3 -> 33.3 ms a frame, cutscene median 47.3 -> 36.3 ms,
+/// p95 205 -> 142 ms, the title's busiest thread 57 -> 47 % of a core.
+///
+/// What it risks, and why it may hold:
+/// - The title's CPU reading what shaders wrote there reads older bytes.
+///   Write-combined memory is what the CPU writes and the GPU reads. With
+///   every copy left on the card (no floor), cutscenes went near black: small
+///   results the title reads back (exposure) came back stale; with the 1 MB
+///   floor the fixed frames equalled those of the plain run.
+/// - A page the CPU writes goes up whole from title memory and so takes back
+///   what shaders wrote in the same page since.
+/// - Another host copy of the same bytes (a texture placed there) does not
+///   see what shaders wrote through title memory.
+fn wc_no_back() -> bool {
+    const SWITCH: &str = "SCARLETT_WC_NO_BACK";
+    static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
+        #[cfg(feature = "diagnostics")]
+        if crate::ab::bit(SWITCH).is_some() {
+            return true;
+        }
+        crate::switch::on(SWITCH)
+    });
+    // (On unless `0` once asked for; `SCARLETT_AB` decides it when it names it.)
+    asked && crate::toggled!("SCARLETT_WC_NO_BACK")
+}
+
+/// The smallest copy whose shader writes [`wc_no_back`] leaves on the card,
+/// in bytes (`SCARLETT_WC_NO_BACK_MIN_KB`, 1024 unless set; 0: all). The
+/// source's own default was 0, and its launcher set 1024 after the near-black
+/// cutscenes of run xd-wcnoback (3,245 write-combined copies, median 4 KB, 82
+/// of 1 MB or more, 7 of 16 MB or more, largest 90 MB; 16 MB measured 35.3 ms
+/// where 1 MB measured 33.3).
+fn wc_no_back_min() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("SCARLETT_WC_NO_BACK_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) * 1024
+    })
+}
+
+/// Bytes shaders were declared to write in write-combined copies and that
+/// were left on the card ([`wc_no_back`]), since the last frame-rate line.
+pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
+
 /// Whether a refresh of a copy in the card's memory takes, and sends up,
 /// the dwords that title memory changed and no others
 /// (`SCARLETT_SEND_CHANGED=1`; off: the 64 KiB pages written since it last
@@ -3304,6 +3402,30 @@ mod landing_tests {
 }
 
 #[cfg(test)]
+mod write_combined_tests {
+    use super::{is_write_combined, title_memory_write_combined, write_combined_freed};
+
+    /// A copy counts as write-combined only inside one such region, and not
+    /// after the region is let go (part of it or the whole allocation).
+    #[test]
+    fn write_combined_regions() {
+        // Addresses of their own: other tests share the registry.
+        let base = 0x7f00_0000_0000usize;
+        title_memory_write_combined(base, 0x100_0000);
+        assert!(is_write_combined(base as u64, 0x1000));
+        assert!(is_write_combined(base as u64 + 0xff_f000, 0x1000));
+        assert!(!is_write_combined(base as u64 + 0xff_f000, 0x2000), "past its end");
+        assert!(!is_write_combined(base as u64 - 0x1000, 0x2000), "before its start");
+        write_combined_freed(base + 0x10_0000, 0x1000);
+        assert!(!is_write_combined(base as u64, 0x1000), "part of it decommitted");
+        let other = base + 0x1000_0000;
+        title_memory_write_combined(other, 0x10_0000);
+        write_combined_freed(other, 0);
+        assert!(!is_write_combined(other as u64, 0x1000), "the allocation released");
+    }
+}
+
+#[cfg(test)]
 mod parts_tests {
     use super::{PAGE, by_parts};
 
@@ -3622,6 +3744,7 @@ impl Shadow {
             changes_only: Default::default(),
             elide: AtomicU8::new(elide::OBSERVING),
             elide_track: Mutex::default(),
+            wc: AtomicU8::new(0),
             mapped: false,
             place: None,
         }
@@ -3654,6 +3777,13 @@ impl Shadow {
         }
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
+        // Write-combined title memory, which the title's CPU does not read
+        // (`SCARLETT_WC_NO_BACK`, trustno1-coder/VIctory-NVIDIA 50c15a1, GPL-3.0):
+        // what shaders write in a big copy with a card side stays on the card.
+        if self.card.is_some() && self.len >= wc_no_back_min() && wc_no_back() && self.write_combined() {
+            WC_LEFT.fetch_add(len, Ordering::Relaxed);
+            return;
+        }
         // Ported from maren-halv/VIctory-DXR dd83629 (GPL-3.0): a copy nothing but shaders has written for a
         // while is not declared, so not compared, fetched or landed (`elide`, `SCARLETT_COPYBACK_ELIDE`).
         if self.elide_skip() {
@@ -3661,6 +3791,27 @@ impl Shadow {
             return;
         }
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// Whether all of the copy's title memory was asked for write-combined
+    /// ([`title_memory_write_combined`]); found once (`SCARLETT_WC_NO_BACK`).
+    fn write_combined(&self) -> bool {
+        match self.wc.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let wc = is_write_combined(self.start, self.len);
+                self.wc.store(if wc { 2 } else { 1 }, Ordering::Relaxed);
+                if wc {
+                    tracing::info!(
+                        start = format_args!("{:#x}", self.start),
+                        len = format_args!("{:#x}", self.len),
+                        "write-combined title memory: what shaders write in its copy is not copied back (SCARLETT_WC_NO_BACK)"
+                    );
+                }
+                wc
+            }
+        }
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
