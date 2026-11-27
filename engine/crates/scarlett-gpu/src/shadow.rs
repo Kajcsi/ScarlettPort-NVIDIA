@@ -302,7 +302,7 @@ impl CopiedState {
     }
 }
 
-pub(crate) mod elide;
+mod elide;
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
@@ -374,9 +374,6 @@ pub(crate) struct Shadow {
     elide: AtomicU8,
     /// What the watching has seen of uploads and fetches.
     elide_track: Mutex<elide::Tracker>,
-    /// Whether its title memory is write-combined ([`Shadow::write_combined`],
-    /// `SCARLETT_WC_NO_BACK`): 0 not known yet, 1 no, 2 yes.
-    wc: AtomicU8,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -2090,53 +2087,24 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 /// this one, the next number to whichever is free: for thousands of small
 /// pieces of work, where a job each ([`wide`]) is mostly the jobs' queue.
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
-    wide_ranges(n, 1, move |range| range.for_each(&work));
-}
-
-/// Claims adjacent jobs together to keep small refreshes from contending
-/// on one atomic for each range. Long or uneven jobs can still claim one.
-pub(crate) fn wide_ranges(n: usize, grain: usize, work: impl Fn(std::ops::Range<usize>) + Send + Sync + 'static) {
-    if n == 0 {
-        return;
-    }
-    let grain = grain.max(1);
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
-    let threads = (wide_threads() + 1).min(n.div_ceil(grain));
+    let threads = (wide_threads() + 1).min(n);
     let jobs = (0..threads)
         .map(|_| {
             let (next, work) = (next.clone(), work.clone());
             Box::new(move || {
                 loop {
-                    let i = next.fetch_add(grain, Ordering::Relaxed);
+                    let i = next.fetch_add(1, Ordering::Relaxed);
                     if i >= n {
                         break;
                     }
-                    work(i..i.saturating_add(grain).min(n));
+                    work(i);
                 }
             }) as Job
         })
         .collect();
     wide(jobs);
-}
-
-#[cfg(test)]
-mod wide_range_tests {
-    use super::*;
-
-    #[test]
-    fn grouped_work_visits_each_index_once() {
-        for n in [0, 1, 7, 8, 9, 63, 64, 255, 513] {
-            let counts = Arc::new((0..n).map(|_| std::sync::atomic::AtomicU8::new(0)).collect::<Vec<_>>());
-            let shared = counts.clone();
-            wide_ranges(n, 8, move |range| {
-                for i in range {
-                    shared[i].fetch_add(1, Ordering::Relaxed);
-                }
-            });
-            assert!(counts.iter().all(|count| count.load(Ordering::Relaxed) == 1), "{n} jobs");
-        }
-    }
 }
 
 /// About this many bytes to a piece of work for [`wide`].
@@ -2564,101 +2532,6 @@ fn land_echo() -> bool {
 /// Since the last frame-rate line: bytes found to be a landing's alone, and
 /// bytes a landing was noted in that were the title's too.
 pub(crate) static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-
-// Write-combined title memory without write-back (`SCARLETT_WC_NO_BACK`). Ported from
-// trustno1-coder/VIctory-NVIDIA 50c15a1 and 2f81d0c (readmet3xt-lab, the foxhound base; GPL-3.0, as
-// this); its mapped-copy half (SCARLETT_WC_BAR) is not ported.
-
-/// Title memory the title asked for write-combined (the console's 0x400
-/// protection bit), as `[start, end)` ([`title_memory_write_combined`]).
-static WRITE_COMBINED: RwLock<Vec<(u64, u64)>> = RwLock::new(Vec::new());
-
-/// The title asked for `[at, at + len)` write-combined: its CPU writes the
-/// memory and does not read it (reads of such memory are uncached on the
-/// console; the results the title reads back go to cacheable memory).
-pub fn title_memory_write_combined(at: usize, len: usize) {
-    if len == 0 {
-        return;
-    }
-    let mut all = WRITE_COMBINED.write().unwrap_or_else(|e| e.into_inner());
-    all.push((at as u64, (at + len) as u64));
-}
-
-/// The title let go of `[at, at + len)` (`len` 0: of the allocation at `at`):
-/// write-combined regions in it are forgotten.
-pub(crate) fn write_combined_freed(at: usize, len: usize) {
-    let (at, end) = (at as u64, at.saturating_add(len) as u64);
-    let mut all = WRITE_COMBINED.write().unwrap_or_else(|e| e.into_inner());
-    if all.is_empty() {
-        return;
-    }
-    all.retain(|&(from, to)| if len == 0 { from != at } else { to <= at || from >= end });
-}
-
-/// Whether all of `[start, start + len)` lies in write-combined title memory
-/// (in one region the title asked for so: regions are hundreds of MB to GB).
-fn is_write_combined(start: u64, len: u64) -> bool {
-    let all = WRITE_COMBINED.read().unwrap_or_else(|e| e.into_inner());
-    all.iter().any(|&(from, to)| from <= start && start + len <= to)
-}
-
-/// Whether what shaders write into copies in the card's memory of
-/// write-combined title memory, of [`wc_no_back_min`] bytes or more, stays on
-/// the card and is not compared, fetched and landed in title memory
-/// (`SCARLETT_WC_NO_BACK=1`; off by default: it can change the picture.
-/// `SCARLETT_AB=<s>,SCARLETT_WC_NO_BACK` turns it on and off while the title
-/// runs).
-///
-/// The write-back of shader writes (`Shadow::gpu_writes`: hashes after sends,
-/// compare passes after the lists, fetches of the pieces that differ and
-/// their landing) keeps title memory the newest for the title's CPU. In the
-/// source fork's gameplay frame seven of the eight largest compared ranges,
-/// about 360 of 730 MB a frame, lay in the title's write-combined memory
-/// (protection 0x2404: 2.2 and 3.2 GB), and 36 MB a frame of it came back.
-/// Measured there (RTX 4070 SUPER, with `_MIN_KB=1024`, runs xd-base-b and
-/// xd-wc1m): gameplay 38.3 -> 33.3 ms a frame, cutscene median 47.3 -> 36.3 ms,
-/// p95 205 -> 142 ms, the title's busiest thread 57 -> 47 % of a core.
-///
-/// What it risks, and why it may hold:
-/// - The title's CPU reading what shaders wrote there reads older bytes.
-///   Write-combined memory is what the CPU writes and the GPU reads. With
-///   every copy left on the card (no floor), cutscenes went near black: small
-///   results the title reads back (exposure) came back stale; with the 1 MB
-///   floor the fixed frames equalled those of the plain run.
-/// - A page the CPU writes goes up whole from title memory and so takes back
-///   what shaders wrote in the same page since.
-/// - Another host copy of the same bytes (a texture placed there) does not
-///   see what shaders wrote through title memory.
-fn wc_no_back() -> bool {
-    const SWITCH: &str = "SCARLETT_WC_NO_BACK";
-    static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let asked = *ASKED.get_or_init(|| {
-        #[cfg(feature = "diagnostics")]
-        if crate::ab::bit(SWITCH).is_some() {
-            return true;
-        }
-        crate::switch::on(SWITCH)
-    });
-    // (On unless `0` once asked for; `SCARLETT_AB` decides it when it names it.)
-    asked && crate::toggled!("SCARLETT_WC_NO_BACK")
-}
-
-/// The smallest copy whose shader writes [`wc_no_back`] leaves on the card,
-/// in bytes (`SCARLETT_WC_NO_BACK_MIN_KB`, 1024 unless set; 0: all). The
-/// source's own default was 0, and its launcher set 1024 after the near-black
-/// cutscenes of run xd-wcnoback (3,245 write-combined copies, median 4 KB, 82
-/// of 1 MB or more, 7 of 16 MB or more, largest 90 MB; 16 MB measured 35.3 ms
-/// where 1 MB measured 33.3).
-fn wc_no_back_min() -> u64 {
-    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MIN.get_or_init(|| {
-        std::env::var("SCARLETT_WC_NO_BACK_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) * 1024
-    })
-}
-
-/// Bytes shaders were declared to write in write-combined copies and that
-/// were left on the card ([`wc_no_back`]), since the last frame-rate line.
-pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
 
 /// Whether a refresh of a copy in the card's memory takes, and sends up,
 /// the dwords that title memory changed and no others
@@ -3431,30 +3304,6 @@ mod landing_tests {
 }
 
 #[cfg(test)]
-mod write_combined_tests {
-    use super::{is_write_combined, title_memory_write_combined, write_combined_freed};
-
-    /// A copy counts as write-combined only inside one such region, and not
-    /// after the region is let go (part of it or the whole allocation).
-    #[test]
-    fn write_combined_regions() {
-        // Addresses of their own: other tests share the registry.
-        let base = 0x7f00_0000_0000usize;
-        title_memory_write_combined(base, 0x100_0000);
-        assert!(is_write_combined(base as u64, 0x1000));
-        assert!(is_write_combined(base as u64 + 0xff_f000, 0x1000));
-        assert!(!is_write_combined(base as u64 + 0xff_f000, 0x2000), "past its end");
-        assert!(!is_write_combined(base as u64 - 0x1000, 0x2000), "before its start");
-        write_combined_freed(base + 0x10_0000, 0x1000);
-        assert!(!is_write_combined(base as u64, 0x1000), "part of it decommitted");
-        let other = base + 0x1000_0000;
-        title_memory_write_combined(other, 0x10_0000);
-        write_combined_freed(other, 0);
-        assert!(!is_write_combined(other as u64, 0x1000), "the allocation released");
-    }
-}
-
-#[cfg(test)]
 mod parts_tests {
     use super::{PAGE, by_parts};
 
@@ -3773,7 +3622,6 @@ impl Shadow {
             changes_only: Default::default(),
             elide: AtomicU8::new(elide::OBSERVING),
             elide_track: Mutex::default(),
-            wc: AtomicU8::new(0),
             mapped: false,
             place: None,
         }
@@ -3806,13 +3654,6 @@ impl Shadow {
         }
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
-        // Write-combined title memory, which the title's CPU does not read
-        // (`SCARLETT_WC_NO_BACK`, trustno1-coder/VIctory-NVIDIA 50c15a1, GPL-3.0):
-        // what shaders write in a big copy with a card side stays on the card.
-        if self.card.is_some() && self.len >= wc_no_back_min() && wc_no_back() && self.write_combined() {
-            WC_LEFT.fetch_add(len, Ordering::Relaxed);
-            return;
-        }
         // Ported from maren-halv/VIctory-DXR dd83629 (GPL-3.0): a copy nothing but shaders has written for a
         // while is not declared, so not compared, fetched or landed (`elide`, `SCARLETT_COPYBACK_ELIDE`).
         if self.elide_skip() {
@@ -3820,27 +3661,6 @@ impl Shadow {
             return;
         }
         list.defer_gpu_write(self, address as usize, len as usize);
-    }
-
-    /// Whether all of the copy's title memory was asked for write-combined
-    /// ([`title_memory_write_combined`]); found once (`SCARLETT_WC_NO_BACK`).
-    fn write_combined(&self) -> bool {
-        match self.wc.load(Ordering::Relaxed) {
-            1 => false,
-            2 => true,
-            _ => {
-                let wc = is_write_combined(self.start, self.len);
-                self.wc.store(if wc { 2 } else { 1 }, Ordering::Relaxed);
-                if wc {
-                    tracing::info!(
-                        start = format_args!("{:#x}", self.start),
-                        len = format_args!("{:#x}", self.len),
-                        "write-combined title memory: what shaders write in its copy is not copied back (SCARLETT_WC_NO_BACK)"
-                    );
-                }
-                wc
-            }
-        }
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -4109,18 +3929,11 @@ impl Shadow {
         if !crate::host::read_into((start + at) as *const u8, title) {
             return 0;
         }
-        thread_local! {
-            static MERGE_WAS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        let was = title.clone();
+        if !merge_piece(now, held, title) {
+            return 0;
         }
-        MERGE_WAS.with(|cell| {
-            let mut was = cell.borrow_mut();
-            was.clear();
-            was.extend_from_slice(title);
-            if !merge_piece(now, held, title) {
-                return 0;
-            }
-            put_changed(start + at, &was, title)
-        })
+        put_changed(start + at, &was, title)
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -5650,17 +5463,15 @@ mod land_tests {
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
-    // A pending constructor and the identity of this registration until it publishes.
-    building: Option<Arc<Mutex<()>>>,
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
 ///
 /// Read by every view a draw names, on all recording threads at once, and
 /// written when a buffer comes, goes or gets its copy: readers share it.
-static BUFFERS: std::sync::RwLock<BufferTable> = std::sync::RwLock::new(BTreeMap::new());
+static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::RwLockWriteGuard<'static, BufferTable> {
+fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
     let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
     // What threads remember of it ([`FOUND`]) is of before.
     BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
@@ -5720,7 +5531,7 @@ fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
     });
 }
 
-fn buffers_read() -> std::sync::RwLockReadGuard<'static, BufferTable> {
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -5731,7 +5542,6 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
         Entry {
             end: start + len,
             shadow: None,
-            building: None,
         },
     );
     // A buffer made again at the same place and address: its old copy may
@@ -5958,167 +5768,120 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     buffers_read().range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).and_then(|(_, e)| e.shadow.clone())
 }
 
-/// Select the same registration after locking, before and after a slow allocation.
-type BufferTable = BTreeMap<(u64, usize), Entry>;
-
-fn buffer_key(map: &BufferTable, address: u64, end: u64) -> Option<(u64, usize)> {
-    map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).map(|(k, _)| *k)
-}
-
-fn still_building(entry: &Entry, ticket: &Arc<Mutex<()>>) -> bool {
-    entry.building.as_ref().is_some_and(|id| Arc::ptr_eq(id, ticket))
-}
-
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
-    lookup_with(address, len, any, |size| host()?.shared_buffer(size))
-}
-
-fn lookup_with(
-    address: u64,
-    len: u64,
-    any: bool,
-    make: impl Fn(u64) -> Option<(ID3D12Resource, *mut u8)>,
-) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
         return Some(shadow);
     }
     let end = address.checked_add(len.max(1))?;
-    loop {
-        {
-            let map = buffers_read();
-            match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
-                Some((_, Entry { shadow: Some(shadow), .. })) => {
-                    if quick {
-                        remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
-                    }
-                    return Some(shadow.clone());
+    {
+        let map = buffers_read();
+        match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
+            // The copy is made already (nearly always).
+            Some((_, Entry { shadow: Some(shadow), .. })) => {
+                if quick {
+                    // (Nobody changes the map while this lock is held.)
+                    remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
                 }
-                Some(_) => {}
-                None => {
-                    drop(map);
-                    return loose(address, end, len <= 1, any);
-                }
+                return Some(shadow.clone());
+            }
+            Some(_) => {}
+            None => {
+                drop(map);
+                return loose(address, end, len <= 1, any);
             }
         }
-        let mut map = buffers();
-        let Some(key) = buffer_key(&map, address, end) else {
-            drop(map);
-            return loose(address, end, len <= 1, any);
-        };
-        let entry = map.get_mut(&key)?;
-        if let Some(shadow) = &entry.shadow {
-            return Some(shadow.clone());
-        }
+    }
+    let mut map = buffers();
+    let key = map
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end)
+        .map(|(k, _)| *k);
+    let Some(key) = key else {
+        drop(map);
+        return loose(address, end, len <= 1, any);
+    };
+    let entry = map.get_mut(&key)?;
+    if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
+        // Shaders write some buffers (unordered access), so not upload memory.
         let size = len.next_multiple_of(1 << 16);
+        // In place, if asked for and the memory can be opened
+        // (`crate::inplace::place_for`): the buffer is the title's own
+        // memory. Not the big ones `cards` puts in the card's memory: those
+        // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
-        if let Some(placed) = crate::port::place_for(key.0, len, false)
-            .or_else(|| if big { None } else { crate::inplace::place_for(key.0, len, false) })
-        {
-            let shadow = Arc::new(Shadow::placed(placed, key.0, len, false));
-            entry.shadow = Some(shadow.clone());
-            return Some(shadow);
+        // Renderer port 1 (`crate::port`, `SCARLETT_PORT_CONSTANTS=1`): the
+        // title's 32-bit graphics heap in place, big or not.
+        if let Some(placed) = crate::port::place_for(key.0, len, false) {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
         }
-        // Keep the original transaction for optional imported/placed memory.
-        // The change below can only manufacture independent, untouched backing.
-        if crate::port::on() || crate::inplace::level() >= 2 {
-            let (buffer, data) = make(size)?;
-            let shadow = copied_buffer(key.0, len, size, buffer, data);
-            entry.shadow = Some(shadow.clone());
-            drop(map);
-            elide::made(&shadow);
-            return Some(shadow);
+        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
         }
-        let ticket = entry.building.get_or_insert_with(Default::default).clone();
-        drop(map);
-        // Never wait for an entry while holding the global table. Other
-        // lookups can proceed; followers of this entry cannot allocate twins.
-        let _only = ticket.lock().unwrap_or_else(|e| e.into_inner());
-        {
-            let map = buffers_read();
-            if buffer_key(&map, address, end) != Some(key) || !map.get(&key).is_some_and(|e| still_building(e, &ticket)) {
-                continue;
+        let (buffer, data) = host()?.shared_buffer(size)?;
+        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+        // A big one, with `cards`: shaders get a buffer in the card's own
+        // memory, and the one just made is the CPU's side.
+        let (buffer, card) = match card_for(size) {
+            Some(on_card) => {
+                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
+                tracing::info!(
+                    start = format_args!("{:#x}", key.0),
+                    len,
+                    "a buffer's host copy is in the card's memory"
+                );
+                let card = Card {
+                    staging: buffer,
+                    before: Mutex::default(),
+                    dirty: Mutex::default(),
+                    sent: Mutex::default(),
+                touched: Default::default(),
+                me: std::sync::OnceLock::new(),
+                has_dirty: Default::default(),
+                has_sent: Default::default(),
+                    size,
+                };
+                (on_card, Some(card))
             }
+            None => (buffer, None),
+        };
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        if len >= 16 << 20 {
+            tracing::info!(
+                start = format_args!("{:#x}", key.0),
+                len,
+                "large buffer copied to the host"
+            );
+        } else {
+            tracing::debug!(
+                start = format_args!("{:#x}", key.0),
+                len,
+                "buffer copied to the host"
+            );
         }
-        let backing = make(size);
-        let mut map = buffers();
-        if buffer_key(&map, address, end) != Some(key) || !map.get(&key).is_some_and(|e| still_building(e, &ticket)) {
-            // Registration was replaced or an overlapping buffer now wins.
-            // Drop an unpublished buffer without blocking table readers.
-            drop(map);
-            drop(backing);
-            continue;
+        let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+        shadow.card = card;
+        let shadow = Arc::new(shadow);
+        if shadow.card.is_some() {
+            carded(&shadow);
+            shadow.elide_note_bounds();
         }
-        let (buffer, data) = backing?;
-        let entry = map.get_mut(&key)?;
-        let shadow = copied_buffer(key.0, len, size, buffer, data);
         entry.shadow = Some(shadow.clone());
-        entry.building = None;
         // Copies of the same memory that are left out of the copy-back are not any more
         // (not under the lock: it looks at the tables).
         drop(map);
         elide::made(&shadow);
         return Some(shadow);
     }
+    entry.shadow.clone()
 }
-
-/// Publish card bookkeeping before attaching the completed copy to its entry.
-fn copied_buffer(start: u64, len: u64, size: u64, buffer: ID3D12Resource, data: *mut u8) -> Arc<Shadow> {
-    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", start));
-    // A big one, with `cards`: shaders get a buffer in the card's own
-    // memory, and the one just made is the CPU's side.
-    let (buffer, card) = match card_for(size) {
-        Some(on_card) => {
-            crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", start));
-            tracing::info!(
-                start = format_args!("{:#x}", start),
-                len,
-                "a buffer's host copy is in the card's memory"
-            );
-            let card = Card {
-                staging: buffer,
-                before: Mutex::default(),
-                dirty: Mutex::default(),
-                has_dirty: Default::default(),
-                sent: Mutex::default(),
-                has_sent: Default::default(),
-                touched: Default::default(),
-                me: std::sync::OnceLock::new(),
-                size,
-            };
-            (on_card, Some(card))
-        }
-        None => (buffer, None),
-    };
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    if len >= 16 << 20 {
-        tracing::info!(
-            start = format_args!("{:#x}", start),
-            len,
-            "large buffer copied to the host"
-        );
-    } else {
-        tracing::debug!(
-            start = format_args!("{:#x}", start),
-            len,
-            "buffer copied to the host"
-        );
-    }
-    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
-    shadow.card = card;
-    let shadow = Arc::new(shadow);
-    if shadow.card.is_some() {
-        carded(&shadow);
-        shadow.elide_note_bounds();
-    }
-    shadow
-}
-
-#[cfg(test)]
-mod title_allocation_tests;
 
 /// Titles also use memory outside any buffer object as GPU memory (
 /// the title's interface vertices, from its own allocator). Such memory

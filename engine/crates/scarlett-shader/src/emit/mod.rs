@@ -93,7 +93,6 @@ pub mod host;
 mod lds_setup;
 #[cfg(all(test, windows))]
 mod lds_setup_tests;
-mod loose_lds;
 mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
@@ -126,7 +125,6 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
-pub use loose_lds::{wave32_fixes, wave_lds_loose};
 pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_host_rdna4, wave64_lds, with_host_wave};
 pub use rect::rect_list_gs;
@@ -489,21 +487,6 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
-    /// Table descriptors (root parameter, dword offset in the table) whose
-    /// buffer the shader reads or writes sixteen bits a channel
-    /// (`buffer_load_format_d16_*`, `buffer_store_format_d16_*`), in
-    /// order. On the console each channel's 16 bits move as they are
-    /// through a 16-bit float view and through a 16-bit integer one alike
-    /// (the title keeps half floats, and indices beside them, in
-    /// `R16G16B16A16_UINT` and `R16_UINT` buffers). The DXIL moves them as
-    /// unsigned integers, which an unsigned 16-bit view carries unchanged;
-    /// the host shows the shader a 16-bit float or signed buffer view at
-    /// these places as the unsigned format of the same layout.
-    /// shortcut: a view in a normalised 16-bit format, whose values the
-    /// console would convert to halves, is read as its integers; a
-    /// descriptor picked at run time keeps the float path (its slot, and so
-    /// its format, is known only then).
-    pub half_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -910,46 +893,6 @@ pub fn emit(
                 }
             }
         }
-        // Last of the barrier-free forms (`SCARLETT_WAVE_LDS_LOOSE=1`, off by default; after
-        // deynesdev fab7fda): LDS read and written inside one lane-branch region, ordered
-        // between the two host waves only where the region is entered and left
-        // (`loose_lds::with`, approximate). A 32-lane host refuses the 64-lane form outright,
-        // which drops every dispatch of the program.
-        if loose_lds::wave_lds_loose() && !strict {
-            for (name, f) in &forms {
-                if let Some((p, st, io, res)) = f {
-                    let again = loose_lds::with(|| emit_program(c, native, p, st, io, res));
-                    report(&format!("loose LDS (APPROXIMATE), {name}"), &again);
-                    if done(&again) {
-                        return again.map(|(shader, _)| shader);
-                    }
-                }
-            }
-            let again = loose_lds::with(|| emit_program(c, native, p, st, io, res));
-            report("loose LDS (APPROXIMATE)", &again);
-            if done(&again) {
-                return again.map(|(shader, _)| shader);
-            }
-            if local_on && !exact_only {
-                for (name, f) in &forms {
-                    if let Some((p, st, io, res)) = f {
-                        let local = loose_lds::with(|| {
-                            lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res))
-                        });
-                        report(&format!("loose LDS + local waves (APPROXIMATE, any mask), {name}"), &local);
-                        if done(&local) {
-                            return local.map(|(shader, _)| shader);
-                        }
-                    }
-                }
-                let local =
-                    loose_lds::with(|| lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res)));
-                report("loose LDS + local waves (APPROXIMATE, any mask)", &local);
-                if done(&local) {
-                    return local.map(|(shader, _)| shader);
-                }
-            }
-        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
@@ -1265,7 +1208,6 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
-        half_views: l.half_views,
     };
     Ok((shader, wave_size))
 }
@@ -2166,7 +2108,6 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
-            half_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -2179,7 +2120,6 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
-                half_views: Vec::new(),
             })
         };
         let ps = file("SCARLETT_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2789,7 +2729,6 @@ mod tests {
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
-            half_views: Vec::new(),
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
@@ -2932,7 +2871,6 @@ mod tests {
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
-            half_views: l.half_views,
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         let cases: [(u32, u32, u32, u32); 12] = [
@@ -3080,7 +3018,6 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
-                half_views: l.half_views,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -3497,7 +3434,6 @@ mod barycentric_tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
-            half_views: Vec::new(),
         };
         validate(&vs);
         // One triangle covers an 8x8 target, with attribute values 2, 6, 10.

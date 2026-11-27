@@ -1544,7 +1544,7 @@ extern "system" fn clear_rtv(
                     State(RENDER_TARGET as i32),
                 )]);
             }
-            list.list.ClearRenderTargetView(rtv.handle, color, rects);
+            list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
     #[cfg(not(windows))]
@@ -1591,7 +1591,7 @@ extern "system" fn clear_dsv(
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list
-                .ClearDepthStencilView(dsv.handle, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
         };
     }
     #[cfg(not(windows))]

@@ -230,7 +230,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views, &host.half_views);
+    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
     Ok(Translated {
         host,
         threads,
@@ -928,8 +928,6 @@ mod library;
 mod make;
 #[cfg(windows)]
 mod ray_tracing;
-#[cfg(windows)]
-pub(crate) mod sampler_order;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
