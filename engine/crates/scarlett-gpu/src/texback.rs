@@ -126,7 +126,7 @@ impl Target {
 
 /// The readback resources and the allocation the pixels belong to.
 pub(crate) struct Back {
-    buffer: ID3D12Resource,
+    buffer: Spare,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     mips: u32,
@@ -137,6 +137,65 @@ pub(crate) struct Back {
 impl Back {
     pub(crate) fn range(&self) -> (usize, usize) {
         (self.ticket.at, self.ticket.end)
+    }
+}
+
+/// A read-back buffer that goes back to [`SPARES`] when the list that holds
+/// its [`Back`] lets it go: at the list's reset, which comes only after the
+/// list's last submission finished, and so after the texels landed. The
+/// water's maps are a few sizes copied back two to ten times a frame, and
+/// each copy made and freed a committed buffer of its own
+/// (`SCARLETT_TEXBACK_SPARE=0`: as before). The idea is cool_fox 67028e21's
+/// (rafaconvaitis), done here with a plain list of spares.
+struct Spare {
+    buffer: Option<ID3D12Resource>,
+    size: u64,
+}
+
+/// Spare read-back buffers by size; at most [`SPARES_KEPT`].
+static SPARES: Mutex<Vec<(u64, ID3D12Resource)>> = Mutex::new(Vec::new());
+const SPARES_KEPT: usize = 32;
+
+fn spares_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SCARLETT_TEXBACK_SPARE").is_none_or(|v| v != "0"))
+}
+
+impl Spare {
+    /// A spare of exactly `size` bytes, else a new buffer.
+    fn take(host: &crate::host::Host, size: u64) -> Option<Self> {
+        let spare = spares_on()
+            .then(|| {
+                let mut spares = SPARES.lock().unwrap_or_else(|e| e.into_inner());
+                let at = spares.iter().position(|&(n, _)| n == size)?;
+                Some(spares.swap_remove(at).1)
+            })
+            .flatten();
+        let buffer = match spare {
+            Some(buffer) => buffer,
+            None => host.read_back_buffer(size)?,
+        };
+        Some(Self { buffer: Some(buffer), size })
+    }
+}
+
+impl std::ops::Deref for Spare {
+    type Target = ID3D12Resource;
+    fn deref(&self) -> &ID3D12Resource {
+        self.buffer.as_ref().expect("a read-back buffer is held until dropped")
+    }
+}
+
+impl Drop for Spare {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take()
+            && spares_on()
+        {
+            let mut spares = SPARES.lock().unwrap_or_else(|e| e.into_inner());
+            if spares.len() < SPARES_KEPT {
+                spares.push((self.size, buffer));
+            }
+        }
     }
 }
 
@@ -177,11 +236,11 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
             .checked_mul(u64::from(format.Depth))?;
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
-    let buffer = host.read_back_buffer(total)?;
+    let buffer = Spare::take(host, total)?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            pResource: unsafe { std::mem::transmute_copy(&*buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
         };
