@@ -1176,10 +1176,15 @@ impl Views {
         Some([i, self.list[i as usize].1])
     }
 
-    /// Entry `i` was named: the clock passes it once more.
+    /// Entry `i` was named: the clock passes it once more. (Written only
+    /// when clear: every draw's lookups of texture views come here, on
+    /// several recording threads, and a store each would bounce the line.)
     fn saw(&self, i: u32) {
-        if let Some(seen) = self.seen.get(i as usize) {
-            seen.store(true, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Some(seen) = self.seen.get(i as usize)
+            && !seen.load(Relaxed)
+        {
+            seen.store(true, Relaxed);
         }
     }
 
