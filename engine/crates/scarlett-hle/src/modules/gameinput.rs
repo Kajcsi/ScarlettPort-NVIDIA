@@ -1512,9 +1512,35 @@ mod host {
         mouse_last_poll: Option<Instant>,
         mouse_look: MouseLook,
         mouse_buttons: MouseButtons,
+        /// The plain mouse look (`look`) holds the pointer only while this is
+        /// on: `F2` or `~` turns it on and off, `Esc`, `P` and losing focus
+        /// turn it off. Off at the start, so the pointer stays free.
+        look_locked: bool,
+        look_just_locked: bool,
+        look_toggle_was_down: bool,
     }
 
     impl Host {
+        /// Turns the plain mouse look's hold on the pointer on or off; the
+        /// pointer is hidden inside the window while it is held.
+        fn set_look_locked(&mut self, locked: bool, hwnd: Option<HWND>) {
+            if self.look_locked == locked {
+                return;
+            }
+            self.look_locked = locked;
+            self.look_just_locked = locked;
+            self.look = (0.0, 0.0);
+            CURSOR_LOCKED.store(locked, Ordering::Release);
+            if let Some(hwnd) = hwnd {
+                let lparam = (HTCLIENT as isize) | ((WM_MOUSEMOVE as isize) << 16);
+                // SAFETY: asynchronous post to our own process's foreground window.
+                unsafe {
+                    let _ = PostMessageW(hwnd, WM_SETCURSOR, hwnd as usize, lparam);
+                }
+            }
+            tracing::info!(locked, "mouse look hold on the pointer");
+        }
+
         fn set_mouse_locked(&mut self, locked: bool, hwnd: Option<HWND>) {
             if self.mouse_locked == locked {
                 return;
@@ -1603,8 +1629,27 @@ mod host {
 
         fn look(&mut self) -> Option<PadState> {
             let sensitivity = mouse_look_sensitivity();
-            if sensitivity <= 0.0 || !focused() {
+            let hwnd = foreground_window();
+            if sensitivity <= 0.0 || hwnd.is_none() {
+                // Focus lost (Alt-Tab, a click elsewhere): let go of the pointer.
+                self.set_look_locked(false, None);
+                self.look_toggle_was_down = false;
                 self.look = (0.0, 0.0);
+                return None;
+            }
+            // SAFETY: plain key state queries.
+            let key_down = |vk: i32| unsafe { GetAsyncKeyState(vk) < 0 };
+            // F2 (0x71) or `~` (VK_OEM_3, 0xC0) takes the pointer for the
+            // camera and gives it back; Esc and P (the pause menu) give it back.
+            let toggle = key_down(0x71) || key_down(0xC0);
+            if toggle && !self.look_toggle_was_down {
+                self.set_look_locked(!self.look_locked, hwnd);
+            }
+            self.look_toggle_was_down = toggle;
+            if self.look_locked && (key_down(0x1B) || key_down(i32::from(b'P'))) {
+                self.set_look_locked(false, hwnd);
+            }
+            if !self.look_locked {
                 return None;
             }
             let mut at = POINT { x: 0, y: 0 };
@@ -1618,6 +1663,10 @@ mod host {
             // The pointer goes back to the window's middle each poll, so it never reaches an edge.
             // SAFETY: plain call.
             unsafe { SetCursorPos(cx, cy) };
+            if std::mem::take(&mut self.look_just_locked) {
+                // Where the pointer was before the hold is not a movement.
+                return None;
+            }
             self.look = look_stick(at.x - cx, at.y - cy, sensitivity, self.look);
             Some(PadState { right_x: self.look.0, right_y: self.look.1, ..Default::default() })
         }
