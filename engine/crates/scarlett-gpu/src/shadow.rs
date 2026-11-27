@@ -302,6 +302,8 @@ impl CopiedState {
     }
 }
 
+mod elide;
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     /// Title memory's pages of 4 KiB (from the one `start` lies in on), a bit
@@ -367,6 +369,11 @@ pub(crate) struct Shadow {
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
+    /// Whether shaders' writes are left out of the copy-back: watching, promoted, or demoted for good
+    /// (`elide`, `SCARLETT_COPYBACK_ELIDE`).
+    elide: AtomicU8,
+    /// What the watching has seen of uploads and fetches.
+    elide_track: Mutex<elide::Tracker>,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -1089,6 +1096,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         };
         let ranges = shadow.card_take(sent_as, fetched);
         if !ranges.is_empty() {
+            shadow.elide_uploaded(&ranges);
             out.push((shadow, ranges));
         }
     }
@@ -3095,6 +3103,7 @@ impl Drop for Shadow {
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
+        self.elide_gone();
         let window = self.window;
         if self.mapped {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
@@ -3611,6 +3620,8 @@ impl Shadow {
             card: None,
             window: false,
             changes_only: Default::default(),
+            elide: AtomicU8::new(elide::OBSERVING),
+            elide_track: Mutex::default(),
             mapped: false,
             place: None,
         }
@@ -3643,6 +3654,12 @@ impl Shadow {
         }
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
+        // Ported from maren-halv/VIctory-DXR dd83629 (GPL-3.0): a copy nothing but shaders has written for a
+        // while is not declared, so not compared, fetched or landed (`elide`, `SCARLETT_COPYBACK_ELIDE`).
+        if self.elide_skip() {
+            self.elide_skipped(len);
+            return;
+        }
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -5854,8 +5871,14 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             carded(&shadow);
+            shadow.elide_note_bounds();
         }
-        entry.shadow = Some(shadow);
+        entry.shadow = Some(shadow.clone());
+        // Copies of the same memory that are left out of the copy-back are not any more
+        // (not under the lock: it looks at the tables).
+        drop(map);
+        elide::made(&shadow);
+        return Some(shadow);
     }
     entry.shadow.clone()
 }
@@ -6063,6 +6086,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     });
     let shadow = Arc::new(shadow);
     carded(&shadow);
+    elide::made(&shadow);
     Some(shadow)
 }
 
@@ -6137,6 +6161,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        drop(map);
+        elide::made(&shadow);
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus
@@ -6153,6 +6179,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        drop(map);
+        elide::made(&shadow);
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -6193,6 +6221,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    drop(map);
+    elide::made(&shadow);
     Some(shadow)
 }
 
@@ -6253,6 +6283,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
     map.insert((address, len), (shadow.clone(), now));
+    // (Not under the lock: it looks at the tables.)
+    drop(map);
+    elide::made(&shadow);
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
