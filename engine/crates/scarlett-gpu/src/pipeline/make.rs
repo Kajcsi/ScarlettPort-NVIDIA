@@ -538,16 +538,16 @@ fn workers() -> bool {
             std::thread::available_parallelism().map_or(2, |n| n.get()),
             crate::residency::limited_host_ram(),
         );
-                // The driver compiles pipelines on this thread, recursively:
-                // NVIDIA's compiler (nvgpucomp64) overflowed the default 2 MB
-                // on a world compute program and refused it as out of memory.
-                .stack_size(PIPELINE_STACK)
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
             let screens_only = i >= workers;
             let spawned = std::thread::Builder::new()
                 .name(format!("scarlett-pipelines-{i}"))
+                // The driver compiles pipelines on this thread, recursively:
+                // NVIDIA's compiler (nvgpucomp64) overflowed the default 2 MB
+                // on a world compute program and refused it as out of memory.
+                .stack_size(PIPELINE_STACK)
                 .spawn(move || {
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
