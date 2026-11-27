@@ -41,6 +41,8 @@ const KERNEL_PAGE: usize = 4096;
 const PARTS: usize = PAGE / KERNEL_PAGE;
 /// All of them.
 const WHOLE: u16 = u16::MAX;
+/// Pages summarized by one entry in [`Journal::written_blocks`].
+const WRITTEN_BLOCK_PAGES: usize = 64;
 
 /// Whether the parts of a page that the kernel names are kept, and a refresh
 /// copies those (`SCARLETT_PAGE_PARTS=0`: the 64 KiB page, as before).
@@ -59,6 +61,10 @@ impl Journal {
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.insert(page, now).unwrap_or(0);
+        self.written_blocks
+            .entry(page / WRITTEN_BLOCK_PAGES)
+            .and_modify(|at| *at = (*at).max(now))
+            .or_insert(now);
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
             return before;
@@ -70,6 +76,29 @@ impl Journal {
             }
         }
         before
+    }
+
+    /// Greatest asking that wrote a page in `[first, last)`, or zero.
+    /// Complete 4 MiB groups use the summary; only the edge groups inspect
+    /// individual journal entries.
+    fn latest_write(&self, first: usize, last: usize) -> u64 {
+        if first >= last {
+            return 0;
+        }
+        let full_first = first.div_ceil(WRITTEN_BLOCK_PAGES);
+        let full_last = last / WRITTEN_BLOCK_PAGES;
+        if full_first >= full_last {
+            return self.written.range(first..last).map(|(_, &at)| at).max().unwrap_or(0);
+        }
+        let leading_end = full_first * WRITTEN_BLOCK_PAGES;
+        let trailing_start = full_last * WRITTEN_BLOCK_PAGES;
+        self.written
+            .range(first..leading_end)
+            .map(|(_, &at)| at)
+            .chain(self.written_blocks.range(full_first..full_last).map(|(_, &at)| at))
+            .chain(self.written.range(trailing_start..last).map(|(_, &at)| at))
+            .max()
+            .unwrap_or(0)
     }
 
     /// The parts of `page` written by an asking after `taken`.
@@ -121,6 +150,9 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
 struct Journal {
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
+    /// Greatest asking in each 4 MiB group of pages. Large unchanged
+    /// refresh ranges can use this before the exact per-page check.
+    written_blocks: BTreeMap<usize, u64>,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
@@ -206,6 +238,7 @@ impl Ahead {
 /// it, found it waiting for that lock (run pooloff1).
 static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     written: BTreeMap::new(),
+    written_blocks: BTreeMap::new(),
     parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
     ahead: Ahead::new(),
     ahead_asked: 0,
@@ -856,8 +889,24 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+    if ranged != 0 && j.latest_write(first, last) <= ranged {
+        return true;
+    }
+    let all_taken = taken.iter().all(|&at| at != 0);
+    if ranged == 0 && !all_taken {
+        return false;
+    }
+    // A sequential pass over the copy's timestamps is cheaper than a large
+    // ordered-map range walk. If the oldest page copy is newer than the
+    // latest write, the whole range is unchanged. Otherwise retain the
+    // exact comparison below.
+    if all_taken && taken.len() >= 16 {
+        let oldest = taken.iter().copied().min().unwrap_or(0).max(ranged);
+        if j.latest_write(first, last) <= oldest {
+            return true;
+        }
+    }
+    j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
 }
 
 impl Tracked {
@@ -3740,6 +3789,7 @@ mod parts_tests {
     fn the_parts_of_a_page_written_since_it_was_taken() {
         let mut j = Journal {
             written: BTreeMap::new(),
+            written_blocks: BTreeMap::new(),
             parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
             ahead: Ahead::new(),
             ahead_asked: 0,
@@ -3761,6 +3811,27 @@ mod parts_tests {
         // A page never written before: what was not named was never written.
         assert_eq!(j.note(9, 0b100, 9), 0);
         assert_eq!(j.parts_since(9, 5), 0b100);
+    }
+
+    #[test]
+    fn latest_write_uses_only_blocks_wholly_inside_the_range() {
+        let mut j = Journal {
+            written: BTreeMap::new(),
+            written_blocks: BTreeMap::new(),
+            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            ahead: Ahead::new(),
+            ahead_asked: 0,
+            kept: false,
+        };
+        j.note(1, WHOLE, 3);
+        j.note(64, WHOLE, 5);
+        j.note(100, WHOLE, 7);
+        j.note(127, WHOLE, 9);
+        j.note(128, WHOLE, 11);
+        assert_eq!(j.latest_write(0, 129), 11);
+        assert_eq!(j.latest_write(2, 128), 9);
+        assert_eq!(j.latest_write(65, 100), 0);
+        assert_eq!(j.latest_write(65, 101), 7);
     }
 }
 
