@@ -1689,7 +1689,16 @@ pub(crate) fn probe_view_limit() {
         } else if fits(UNCAPPED_VIEWS) {
             UNCAPPED_VIEWS
         } else {
-            PORTABLE_VIEWS
+            // LOCAL (NVIDIA, scar13): the most the host takes between the
+            // portable limit and the uncapped size, to 4,096 views, rather
+            // than the portable limit itself: every slot past 1,000,000 is
+            // one more of the title's kept in place.
+            let (mut low, mut high) = (PORTABLE_VIEWS, UNCAPPED_VIEWS);
+            while high - low > 4096 {
+                let mid = low + (high - low) / 2;
+                if fits(mid) { low = mid } else { high = mid }
+            }
+            low
         };
         tracing::info!(
             views,
@@ -1713,6 +1722,10 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// The title's view slots a capped host heap keeps in place at the least
+/// (`dynamic_slots`): past the highest seen, about 720,000.
+const TITLE_VIEWS_KEPT: u32 = 737_280;
+
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
 /// host that takes more than [`PORTABLE_VIEWS`]; `SCARLETT_DYNAMIC_SLOTS`
@@ -1733,12 +1746,24 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
         // tables a frame refused, each a dropped draw). `SCARLETT_DYNAMIC_SLOTS`
         // takes more of them from the title's slots kept in place (tables
         // past those are made afresh here anyway), at most half the heap.
+        //
+        // LOCAL (scar13): but never so many that title slots shaders pick
+        // textures by index from (up to about 720,000) lose their place:
+        // 524,288 asked left 500,000 in place, the heap sync left every slot
+        // past them out, and a texture picked from one read whatever per-draw
+        // table lay there (black blocks on water and in the world, scar6 to
+        // scar12). `SCARLETT_TITLE_VIEWS_KEPT` sets that floor.
         static CAPPED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         return *CAPPED.get_or_init(|| {
             let asked = std::env::var("SCARLETT_DYNAMIC_SLOTS").ok().and_then(|v| v.trim().parse::<u32>().ok());
-            let slots = asked.unwrap_or(DYNAMIC).clamp(DYNAMIC, null / 2);
-            if slots != DYNAMIC {
-                tracing::warn!(slots, title_in_place = null - slots, "LOCAL dynamic descriptor slots on a capped view heap");
+            let kept = std::env::var("SCARLETT_TITLE_VIEWS_KEPT")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(TITLE_VIEWS_KEPT);
+            let most = null.saturating_sub(kept).clamp(DYNAMIC, null / 2);
+            let slots = asked.unwrap_or(DYNAMIC).clamp(DYNAMIC, most);
+            if slots != DYNAMIC || asked.is_some_and(|a| a > slots) {
+                tracing::warn!(slots, asked, title_in_place = null - slots, "LOCAL dynamic descriptor slots on a capped view heap");
             }
             slots
         });

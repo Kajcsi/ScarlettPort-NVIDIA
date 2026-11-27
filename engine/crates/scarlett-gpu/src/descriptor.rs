@@ -346,6 +346,9 @@ pub(crate) fn sync_heaps() {
         let began = std::time::Instant::now();
         let taken = written.take(start as usize, end as usize);
         spent[0] += since(began);
+        if !heap.samplers() {
+            past_the_host(&taken, start as usize, step, mirrored_count);
+        }
         let mut parts: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in taken {
             let mut page = range_from & !(crate::watch::PAGE - 1);
@@ -629,6 +632,43 @@ pub(crate) fn sync_line(frames: f64) {
         split[3] / 1e6 / frames,
         split[4] / 1e6 / frames
     );
+}
+
+/// Diagnostic (NVIDIA heap cap): views the title wrote into slots of its
+/// view heap past the ones the host heap holds in place, which shaders that
+/// pick textures by index read as whatever per-draw table lies there. Says
+/// each new highest such slot that holds a view, and how many there are.
+#[cfg(windows)]
+fn past_the_host(taken: &[(usize, usize)], heap_start: usize, step: u64, mirrored_count: u32) {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+    static HIGHEST: AtomicU32 = AtomicU32::new(0);
+    static VIEWS: AtomicU64 = AtomicU64::new(0);
+    let mut record = [0u8; 4];
+    for &(from, to) in taken {
+        let last = ((to - heap_start) as u64).div_ceil(step);
+        if last <= u64::from(mirrored_count) {
+            continue;
+        }
+        let first = ((from - heap_start) as u64 / step).max(u64::from(mirrored_count));
+        for slot in first..last {
+            let at = heap_start + (slot * step) as usize;
+            if !crate::host::read_into(at as *const u8, &mut record) || u32::from_le_bytes(record) != VIEW_TAG {
+                continue;
+            }
+            let views = VIEWS.fetch_add(1, Relaxed) + 1;
+            let slot = slot as u32;
+            let before = HIGHEST.fetch_max(slot, Relaxed);
+            // (A line for each new 4,096 slots reached.)
+            if views == 1 || (slot > before && slot >> 12 != before >> 12) {
+                tracing::info!(
+                    slot,
+                    in_place = mirrored_count,
+                    views_written_past = views,
+                    "title view slot past the host heap's in-place slots (shaders picking it read a per-draw slot)"
+                );
+            }
+        }
+    }
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.
