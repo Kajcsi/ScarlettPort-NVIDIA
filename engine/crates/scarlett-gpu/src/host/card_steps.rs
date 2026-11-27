@@ -588,7 +588,7 @@ fn record(
         } else {
             list.ResourceBarrier(&[transition(between, constants, dest)]);
         }
-        for &(buffer, offset, at, len) in reads {
+        for (buffer, offset, at, len) in joined_reads(reads) {
             list.CopyBufferRegion(between, at, buffer, offset, len);
         }
         list.ResourceBarrier(&barriers);
@@ -599,6 +599,57 @@ fn record(
             list.ResourceBarrier(&done);
         }
     }
+}
+
+/// Whether reads that lie next to each other in the same buffer, as they lie
+/// in ours, are one copy (`SCARLETT_CARD_STEP_JOIN`, on unless `=0`).
+///
+/// The fills of the title's constant ring are 7,500 to 16,000 a frame in the
+/// open world, a few hundred bytes each at 256-byte places: one
+/// `CopyBufferRegion` each, recorded on the submitting thread and run one by
+/// one by the card. Places in ours are given out in order, each at the next
+/// 256 bytes ([`Host::card_steps`]), so two places that follow each other in
+/// both buffers by the same distance are one range: the bytes between them in
+/// ours are padding nobody's slot shows, and in the source lie inside the
+/// host copy, between two ranges the refresh of that copy covers.
+fn join_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SCARLETT_CARD_STEP_JOIN").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame-rate line: reads asked for, and copies recorded for them.
+static JOINED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// `reads` (source, offset in it, offset in ours, bytes) as copies: with
+/// [`join_on`] those that follow one another in both buffers by the same
+/// distance, with nothing but padding between them in ours, become one.
+fn joined_reads<'a>(reads: &[(&'a ID3D12Resource, u64, u64, u64)]) -> Vec<(&'a ID3D12Resource, u64, u64, u64)> {
+    JOINED[0].fetch_add(reads.len() as u64, Ordering::Relaxed);
+    if !join_on() || reads.len() < 2 {
+        JOINED[1].fetch_add(reads.len() as u64, Ordering::Relaxed);
+        return reads.to_vec();
+    }
+    let mut sorted = reads.to_vec();
+    sorted.sort_unstable_by_key(|&(b, offset, at, _)| (b.as_raw() as usize, at, offset));
+    let mut out: Vec<(&ID3D12Resource, u64, u64, u64)> = Vec::with_capacity(sorted.len());
+    for r in sorted {
+        if let Some(last) = out.last_mut() {
+            let (b, offset, at, len) = r;
+            let end = last.2 + last.3;
+            if b.as_raw() == last.0.as_raw()
+                && at >= end
+                && at == end.next_multiple_of(256)
+                && offset >= last.1
+                && offset - last.1 == at - last.2
+            {
+                last.3 = at + len - last.2;
+                continue;
+            }
+        }
+        out.push(r);
+    }
+    JOINED[1].fetch_add(out.len() as u64, Ordering::Relaxed);
+    out
 }
 
 /// The list in front of a submission's, and its buffer ([`BETWEEN`] bytes).
@@ -910,12 +961,15 @@ pub(super) fn log(frames: f64) {
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "steps done on the card instead of waiting for flights, per frame (SCARLETT_CARD_STEPS={}): {:.2} fills, {:.2} buffer \
-         copies, {:.1} KB; {:.2} submissions refused and waited",
+         copies, {:.1} KB; {:.2} submissions refused and waited; their reads {:.0} in {:.0} copies (SCARLETT_CARD_STEP_JOIN={})",
         stage(),
         d[0],
         d[1],
         d[2] / 1024.0,
         d[3],
+        JOINED[0].swap(0, Ordering::Relaxed) as f64 / frames,
+        JOINED[1].swap(0, Ordering::Relaxed) as f64 / frames,
+        u8::from(join_on()),
     );
     #[cfg(feature = "diagnostics")]
     {
