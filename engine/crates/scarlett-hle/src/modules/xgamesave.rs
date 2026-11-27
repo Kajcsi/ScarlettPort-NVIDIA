@@ -220,24 +220,14 @@ fn discard(path: &Path) {
     // On by default since 0.5.0 (REL050-ON); `=0` brings back the retries.
     let no_wait = *NO_WAIT.get_or_init(|| std::env::var_os("SCARLETT_SAVE_NO_WAIT").is_none_or(|v| v != "0"));
     let stayed = || STAYED.lock().unwrap_or_else(|e| e.into_inner());
-    // A leftover that stayed before is tried again (one plain attempt, no
-    // waiting: it goes at a later save once the file is free), but not
-    // reported again.
-    let stayed_before = no_wait && stayed().iter().any(|p| p == path);
+    if no_wait && stayed().iter().any(|p| p == path) {
+        return;
+    }
     let began = std::time::Instant::now();
     let removed = if no_wait { remove_plainly(path) } else { retry(|| std::fs::remove_dir_all(path)) };
     match removed {
-        Ok(()) => {
-            if stayed_before {
-                stayed().retain(|p| p != path);
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if stayed_before {
-                stayed().retain(|p| p != path);
-            }
-        }
-        Err(_) if stayed_before => {}
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             #[cfg(windows)]
             if super::waitlog::threshold_ms().is_some() {

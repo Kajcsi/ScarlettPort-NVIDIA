@@ -105,15 +105,6 @@ fn build() -> [u8; 32] {
         bytes.push(scarlett_shader::emit::wave64_lds() as u8);
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&scarlett_shader::emit::shader_opt().to_le_bytes());
-        // Only when on (after deynesdev fab7fda): the loose-LDS forms of wave64
-        // programs on 32-lane hosts (`SCARLETT_WAVE_LDS_LOOSE=1`), and `ds_bpermute` within
-        // 32-lane halves with the 32 KiB group-shared limit kept to (`SCARLETT_WAVE32_FIXES=1`).
-        if scarlett_shader::emit::wave_lds_loose() {
-            bytes.extend_from_slice(b"SCARLETT_WAVE_LDS_LOOSE=1");
-        }
-        if scarlett_shader::emit::wave32_fixes() {
-            bytes.extend_from_slice(b"SCARLETT_WAVE32_FIXES=1");
-        }
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -239,7 +230,6 @@ fn splice(dir: &std::path::Path, hash: &str, container: &[u8], ours: Option<&Hos
         if ours.root_srvs != theirs.root_srvs { d.push("root_srvs"); }
         if ours.root_uavs != theirs.root_uavs { d.push("root_uavs"); }
         if ours.root_indexed_views != theirs.root_indexed_views { d.push("root_indexed_views"); }
-        if ours.half_views != theirs.half_views { d.push("half_views"); }
         d.join(",")
     };
     if let Some(ours) = ours {
@@ -435,11 +425,6 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
-    word(&mut out, s.half_views.len() as u32);
-    for &(slot, dword) in &s.half_views {
-        word(&mut out, u32::from(slot));
-        word(&mut out, dword);
-    }
     out
 }
 
@@ -508,11 +493,6 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
-    let n = r.word()? as usize;
-    let mut half_views = Vec::with_capacity(n.min(256));
-    for _ in 0..n {
-        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
-    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -523,7 +503,6 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
-        half_views,
     })
 }
 
@@ -584,7 +563,6 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
-            half_views: vec![(0, 8), (4, 0)],
         }
     }
 

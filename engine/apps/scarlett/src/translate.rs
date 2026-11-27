@@ -487,10 +487,6 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
         failed.values().map(|f| f.0).sum::<usize>(),
         started.elapsed().as_secs_f64()
     );
-    println!(
-        "{} of them with mask-SCC branches taken by each host wave on its own (approximate; the wave-wide form refused them)",
-        scarlett_shader::emit::scc_per_host_wave_programs()
-    );
     if done > 0 && std::env::var_os("SCARLETT_TRANSLATE_ONLY").is_none() {
         let _ = std::fs::write(shader_dir.join(".translator"), scarlett_hle::SHADER_TRANSLATOR);
     }

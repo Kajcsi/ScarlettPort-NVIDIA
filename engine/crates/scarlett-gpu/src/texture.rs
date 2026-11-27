@@ -438,14 +438,8 @@ fn exact_unlocked() -> bool {
 /// counters, runs 81, 83, 85 and 94 each had lines of 1.5-2.9 s), and the
 /// submitting thread is not running while it lasts (run 93: 240-310 ms of
 /// its own time a frame beside 1,100-1,800 ms of "textures"): it waits.
-/// These say for what. Places 4 and 5: of the rest, the time detiling
-/// ([`Staging::detile`]) and hashing ([`digest`]), to tell what detiling on
-/// the card would spare.
-pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
-
-/// The longest one texture's refresh took since the last line (µs) and its
-/// bytes: one refresh longer than the rest holds up the batch it is in.
-pub(crate) static REFRESH_LONGEST: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// These say for what.
+pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
@@ -759,10 +753,6 @@ fn once() -> bool {
 /// cryptographic one, which took 0.27 ms a megabyte, four times the detiling
 /// it was to spare; nobody makes up textures to collide.)
 pub(crate) fn digest(bytes: &[u8]) -> Digest {
-    waited(5, || digest_of(bytes))
-}
-
-fn digest_of(bytes: &[u8]) -> Digest {
     const K: [u64; 8] = [
         0xa076_1d64_78bd_642f,
         0xe703_7ed1_a0b4_28db,
@@ -1475,11 +1465,7 @@ impl Staging {
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
         let read = self.refresh_timed();
-        let us = whole.elapsed().as_micros() as u64;
-        REFRESH_WAITS[3].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
-        if REFRESH_LONGEST[0].fetch_max(us, std::sync::atomic::Ordering::Relaxed) < us {
-            REFRESH_LONGEST[1].store(read as u64, std::sync::atomic::Ordering::Relaxed);
-        }
+        REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         read
     }
 
@@ -1758,10 +1744,6 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
-        waited(4, || self.detile_now(tiled));
-    }
-
-    fn detile_now(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
