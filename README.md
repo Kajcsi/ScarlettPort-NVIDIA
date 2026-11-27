@@ -15,7 +15,6 @@ This is an unofficial fan project. It is not affiliated with or endorsed by Rock
 - **Rendering fixes**
   - Black shapes in the world: writes made at one address of shared memory are passed on to its other addresses, and those textures are rechecked for as long as they exist.
   - Red stair-step halos around characters: the ambient light pass weighs samples by depth.
-  - Black blocks on water: high texture slots are mirrored, and the game's used slots are kept in place.
   - Sparse mip allocations are honoured.
   - A 16-bit sign-extension shader fix.
 - **Audio**
