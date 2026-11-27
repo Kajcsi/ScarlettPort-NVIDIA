@@ -1148,7 +1148,25 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+        // One object for every pipeline with this very layout: the list
+        // sets a root signature only when the object changes, and a set
+        // drops every root argument of its side, which the state cache then
+        // sets again. Per-pipeline objects made each pipeline change one.
+        // `SCARLETT_ROOT_DEDUPE=0`: one object per pipeline, as before.
+        if !crate::toggled!("SCARLETT_ROOT_DEDUPE") {
+            return Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()));
+        }
+        static MADE: std::sync::Mutex<Option<std::collections::HashMap<(usize, Vec<u8>), ID3D12RootSignature>>> =
+            std::sync::Mutex::new(None);
+        let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+        let made = made.get_or_insert_with(Default::default);
+        let key = (windows::core::Interface::as_raw(device) as usize, bytes.to_vec());
+        if let Some(root) = made.get(&key) {
+            return Ok((root.clone(), key.1));
+        }
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        made.insert(key.clone(), root.clone());
+        Ok((root, key.1))
     }
 }
 
