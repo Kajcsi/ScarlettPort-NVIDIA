@@ -9140,6 +9140,13 @@ impl Batch {
         // many: then beside the others.
         const FEW: usize = 256;
         let mut spans = spans;
+        // Placed copies are an unconditional no-op in `Shadow::nothing_new`.
+        // Drop them before `wide_each` so a street scene does not schedule
+        // thousands of worker jobs whose only work is that one check.
+        let _before_placed = spans.len();
+        spans.retain(|(shadow, _, _)| !shadow.refresh_never_copies());
+        #[cfg(feature = "diagnostics")]
+        FLUSHES[2].fetch_add((_before_placed - spans.len()) as u64, Ordering::Relaxed);
         // (Renderer port #6: on the threads beside, whatever their number.)
         let many = spans.len() > FEW || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4;
         if !many {

@@ -3926,8 +3926,15 @@ impl Shadow {
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
+    pub(crate) fn refresh_never_copies(&self) -> bool {
+        // Placed host copies live in card memory. `nothing_new` has always
+        // returned immediately for them; expose that lock-free fact so a
+        // large refresh batch can discard them before making worker jobs.
+        self.place.is_some()
+    }
+
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
-        if self.place.is_some() {
+        if self.refresh_never_copies() {
             return true;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
