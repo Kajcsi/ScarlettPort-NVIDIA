@@ -53,6 +53,21 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     scarlett_hle::modules::lifecycle::wait_for_previous();
     let cfg = scarlett_core::Config::load()?;
+    // DLSS and frame generation (`SCARLETT_DLSS`, `SCARLETT_FRAMEGEN`):
+    // Streamline is loaded before anything of the title or the host GPU, and
+    // fails soft; only if it offers one of them does the title render through
+    // its FidelityFX path, which DLSS takes over (`resolution::Upscaler`).
+    let asked = scarlett_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
+    let available = scarlett_hle::streamline::init(&asked);
+    let upscaler = (available.dlss || available.framegen).then_some(asked.mode);
+    if asked.any() {
+        println!(
+            "upscaling      DLSS {}, frame generation {}{}",
+            if available.dlss { "on" } else if asked.dlss { "asked, not available" } else { "off" },
+            if available.framegen { "on" } else if asked.framegen { "asked, not available" } else { "off" },
+            upscaler.map(|m| format!(", scene at the {} scale ({}) through the title's FidelityFX path", m.name(), m.scale())).unwrap_or_default()
+        );
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = scarlett_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -175,7 +190,10 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    // The title's FidelityFX calls go through ours when DLSS or frame
+    // generation is on (bound as before otherwise).
+    let interposed = scarlett_hle::modules::fidelityfx::Interpose { inner: &with_dlls };
+    show(&exe_name, image.bind_imports(&interposed, policy)?);
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
@@ -186,8 +204,9 @@ pub fn run(
     #[cfg(windows)]
     if execute {
         let size = image.info().size_of_image as usize;
+        let upscaler = upscaler.map(|m| scarlett_loader::resolution::Upscaler { ffx_mode: m.ffx_mode(), scale: m.scale(), name: m.name() });
         // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { scarlett_loader::resolution::apply_asked(image.base(), size) };
+        unsafe { scarlett_loader::resolution::apply_asked(image.base(), size, upscaler) };
     }
     // The frame rate (SCARLETT_FRAME_INTERVAL_MS, off without it): our frame
     // clock ticks at that interval (scarlett-gpu), and the title is given

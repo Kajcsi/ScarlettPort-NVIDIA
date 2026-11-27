@@ -37,6 +37,16 @@
 //!   the title divided by it (+0x28f03e8) 49 s in.
 //! - **Upscaler.** `SCARLETT_UPSCALER=<kind>` makes the picker return
 //!   `kind` (pull request #53): 6 the title's own, 7 FidelityFX.
+//! - **DLSS** (`SCARLETT_DLSS=1` with Streamline there, [`Upscaler`]): the
+//!   picker returns 7, and FidelityFX's render size method notes the DLSS
+//!   mode's FidelityFX quality mode at +0x90 of it and always takes the
+//!   scaled branch, whose two loads read the mode's scale (as
+//!   `SCARLETT_FFX_SCALE` does); the title's own upscaler's scale is set to
+//!   the same, as the stock image pairs them (2/3 each). DLSS then takes the
+//!   title's upscale dispatches (`scarlett_hle::modules::fidelityfx`). In
+//!   place of `SCARLETT_RENDER_SCALE`, `SCARLETT_FFX_SCALE` and
+//!   `SCARLETT_UPSCALER`, which are left out (said so). From pepezin's fork
+//!   (`native_1440p::prepare_upscaler`, after DexNom's `prepare_fsr_4k`).
 
 /// What became of a site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +295,33 @@ pub fn ffx_scale_code(scale: f32) -> Vec<u8> {
     c
 }
 
+/// The render size method's instructions that note the console check's
+/// result as the FidelityFX quality mode and pick the branch: `movzx eax, al
+/// ; mov [r14+90h], eax ; test al, al ; jne scaled`.
+const FFX_SIZING: usize = 0x1a;
+const STOCK_FFX_SIZING: [u8; 14] = [0x0f, 0xb6, 0xc0, 0x41, 0x89, 0x86, 0x90, 0, 0, 0, 0x84, 0xc0, 0x75, 0x0a];
+
+/// What goes at [`FFX_SCALE`] for DLSS: [`ffx_scale_code`] at `scale`, and
+/// `mov eax, ffx_mode ; mov [r14+90h], eax ; jmp scaled` in place of
+/// [`STOCK_FFX_SIZING`] (the same length; the jump lands where `jne` did).
+pub fn ffx_upscaler_code(ffx_mode: u8, scale: f32) -> Vec<u8> {
+    let mut c = ffx_scale_code(scale);
+    debug_assert_eq!(FFX_SCALE.bytes[FFX_SIZING..FFX_SIZING + 14], STOCK_FFX_SIZING);
+    c[FFX_SIZING..FFX_SIZING + 14].copy_from_slice(&[0xb8, ffx_mode, 0, 0, 0, 0x41, 0x89, 0x86, 0x90, 0, 0, 0, 0xeb, 0x0a]);
+    c
+}
+
+/// The title's FidelityFX path, taken over by DLSS: the FidelityFX quality
+/// mode the title notes (0 native AA to 4 ultra performance) and the render
+/// scale of the output.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Upscaler {
+    pub ffx_mode: u8,
+    pub scale: f32,
+    /// For the log: the DLSS mode's name.
+    pub name: &'static str,
+}
+
 /// `mov eax, kind ; ret`.
 pub fn picker_code(kind: u32) -> Vec<u8> {
     let mut c = vec![0xb8];
@@ -345,7 +382,7 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
 /// The image of `size` bytes at `base` stays mapped and no thread runs its
 /// code yet.
 #[cfg(windows)]
-pub unsafe fn apply_asked(base: usize, size: usize) {
+pub unsafe fn apply_asked(base: usize, size: usize, upscaler: Option<Upscaler>) {
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
     if let Some((w, h)) = asked_output() {
         asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
@@ -353,16 +390,30 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
             asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
         }
     }
-    if let Some(s) = asked_render_scale() {
-        asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
-    }
-    if let Some(s) = asked_ffx_scale() {
-        asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
-    }
-    let (kind, why) = chosen_upscaler(fsr_dll_in_game_dir);
-    match kind {
-        Some(kind) => asked.push((&PICKER, picker_code(kind), format!("returns {kind}, {why}"))),
-        None => tracing::info!(why, "upscaler picker left alone"),
+    if let Some(up) = upscaler {
+        // DLSS through the title's FidelityFX path: these three sites are its.
+        for name in ["RENDER_SCALE", "FFX_SCALE", "UPSCALER", "OWN_UPSCALER"] {
+            if let Some(v) = var(name) {
+                tracing::warn!("SCARLETT_{name}={v} is left out: DLSS sets the upscaler and its render scale");
+                println!("resolution: SCARLETT_{name}={v} is left out: DLSS sets the upscaler and its render scale");
+            }
+        }
+        let value = format!("DLSS {}, scale {}", up.name, up.scale);
+        asked.push((&PICKER, picker_code(7), format!("returns 7, {value}")));
+        asked.push((&FFX_SCALE, ffx_upscaler_code(up.ffx_mode, up.scale), format!("{value}, FidelityFX mode {}", up.ffx_mode)));
+        asked.push((&OWN_SCALE, own_scale_code(up.scale), value));
+    } else {
+        if let Some(s) = asked_render_scale() {
+            asked.push((&OWN_SCALE, own_scale_code(s), format!("{s}")));
+        }
+        if let Some(s) = asked_ffx_scale() {
+            asked.push((&FFX_SCALE, ffx_scale_code(s), format!("{s}")));
+        }
+        let (kind, why) = chosen_upscaler(fsr_dll_in_game_dir);
+        match kind {
+            Some(kind) => asked.push((&PICKER, picker_code(kind), format!("returns {kind}, {why}"))),
+            None => tracing::info!(why, "upscaler picker left alone"),
+        }
     }
     for (site, code, value) in asked {
         // SAFETY: the caller's promise.
@@ -459,6 +510,28 @@ mod tests {
         assert!(changed.iter().all(|&i| (0x2c..0x30).contains(&i) || (0x36..0x3a).contains(&i) || (0x64..0x68).contains(&i)));
         assert_eq!(picker_code(7), [0xb8, 7, 0, 0, 0, 0xc3]);
         assert_eq!(pool_check_code(), [0x48, 0x3d, 0xff, 0xff, 0x1f, 0x00, 0xeb, 0x01]);
+    }
+
+    /// DLSS's code for FidelityFX's render size: the mode noted, the scaled
+    /// branch always taken, and it loads the mode's scale.
+    #[test]
+    fn the_dlss_sizing_code() {
+        assert_eq!(FFX_SCALE.bytes[FFX_SIZING..FFX_SIZING + 14], STOCK_FFX_SIZING);
+        for (mode, scale) in [(0u8, 1.0f32), (1, 2.0 / 3.0), (2, 0.58), (3, 0.5), (4, 1.0 / 3.0)] {
+            let c = ffx_upscaler_code(mode, scale);
+            assert_eq!(c.len(), FFX_SCALE.bytes.len());
+            assert_eq!(c[FFX_SIZING..FFX_SIZING + 5], [0xb8, mode, 0, 0, 0], "mov eax, mode");
+            assert_eq!(c[FFX_SIZING + 5..FFX_SIZING + 12], [0x41, 0x89, 0x86, 0x90, 0, 0, 0], "mov [r14+90h], eax");
+            // `jmp` lands where the stock `jne` did: the scaled load.
+            assert_eq!(c[FFX_SIZING + 12..FFX_SIZING + 14], [0xeb, 0x0a]);
+            assert_eq!(FFX_SIZING + 14 + 0x0a, 0x32);
+            let disp = i32::from_le_bytes(c[0x36..0x3a].try_into().unwrap());
+            let loaded = (0x32 + 8 + disp) as usize;
+            assert_eq!(f32::from_le_bytes(c[loaded..loaded + 4].try_into().unwrap()), scale);
+            // Outside the sizing and the scale code, the function is the title's.
+            let scaled = ffx_scale_code(scale);
+            assert!((0..c.len()).filter(|i| !(FFX_SIZING..FFX_SIZING + 14).contains(i)).all(|i| c[i] == scaled[i]));
+        }
     }
 
     #[cfg(windows)]
