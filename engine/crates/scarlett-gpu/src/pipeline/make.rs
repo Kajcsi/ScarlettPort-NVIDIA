@@ -87,35 +87,45 @@ fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
         && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
 }
 
+/// A pass that shades ray-tracing hits or activates rays: without the
+/// structure builder its structures hold nothing, so it finds no hits and
+/// writes its miss colours. Made and run like any other pipeline; left out
+/// only when asked (`left_out_now`). The water's tiled light is left out
+/// whenever asked for (`SCARLETT_WATER_LIGHT=0`).
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if water_light_left_out(shaders) {
         return Some("the water's tiled light on a host of 32-lane waves, left out (SCARLETT_WATER_LIGHT=0)");
     }
-    static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
-    let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
-        let builder = std::env::var_os("SCARLETT_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return false;
-        }
-        // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
-        // clogging the cold compiler queue; skip unless SCARLETT_RT_RESOLVE=1.
-        std::env::var_os("SCARLETT_RT_RESOLVE").is_none_or(|v| v == "0")
-    });
-    if skip_rt && named(shaders, b"CS_RaytracingResolve") {
-        return Some("shades ray-tracing hits without BVH, left out");
+    if named(shaders, b"CS_RaytracingResolve") {
+        return Some("shades ray-tracing hits, left out (SCARLETT_RT_RESOLVE=0)");
     }
-    static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
-    let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
-        let builder = std::env::var_os("SCARLETT_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return std::env::var_os("SCARLETT_ACTIVATE_RAYS").is_some_and(|v| v == "0");
-        }
-        std::env::var_os("SCARLETT_ACTIVATE_RAYS").is_none_or(|v| v == "0")
-    });
-    if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
-        return Some("ray activation shader without BVH, left out");
+    if named(shaders, b"CS_ScreenProbes_ActivateRays") {
+        return Some("ray activation shader, left out (SCARLETT_ACTIVATE_RAYS=0)");
     }
     None
+}
+
+/// Whether the passes of [`left_out`] are left out now. By default they
+/// run (they were left out while the builder was off: about 590 dispatches
+/// a frame without a pipeline, among them the skin, eye and hair
+/// resolves). `SCARLETT_RT_RESOLVE=0` / `SCARLETT_ACTIVATE_RAYS=0` leave
+/// them out as before; live with `SCARLETT_AB=<s>,SCARLETT_RT_LEFT_OUT`.
+fn left_out_now(why: &'static str) -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("SCARLETT_RT_LEFT_OUT") {
+        return on;
+    }
+    if why.contains("WATER_LIGHT") {
+        return true;
+    }
+    static RESOLVE: OnceLock<bool> = OnceLock::new();
+    static ACTIVATE: OnceLock<bool> = OnceLock::new();
+    let asked = |name: &str| std::env::var_os(name).is_some_and(|v| v == "0");
+    if why.contains("RT_RESOLVE") {
+        *RESOLVE.get_or_init(|| asked("SCARLETT_RT_RESOLVE"))
+    } else {
+        *ACTIVATE.get_or_init(|| asked("SCARLETT_ACTIVATE_RAYS"))
+    }
 }
 
 /// Confirmed first-scene producers. Prepare these at creation even on a cold
@@ -143,7 +153,7 @@ unsafe impl Sync for Pending {}
 impl Pending {
     /// Left out for good, or a ray tracing pass while ray tracing is off.
     fn skipped(&self) -> bool {
-        self.left_out.is_some() || (self.ray_pass.is_some() && super::ray_tracing::off_now())
+        self.left_out.is_some_and(left_out_now) || (self.ray_pass.is_some() && super::ray_tracing::off_now())
     }
 
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
@@ -229,7 +239,7 @@ impl Pending {
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     // Left out ones are never made: not "being made" (scar13 counted some 900
     // draws a frame so, with nothing queued).
-    if let Some(why) = p.left_out {
+    if let Some(why) = p.left_out.filter(|&why| left_out_now(why)) {
         return Some(why.into());
     }
     if let Some(why) = p.ray_pass.filter(|_| super::ray_tracing::off_now()) {
@@ -237,6 +247,14 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
     match p.made.get() {
         Some(Some(_)) => None,
+        // Left out: never queued, so not "being made".
+        None if p.skipped() => Some(
+            p.left_out
+                .filter(|&why| left_out_now(why))
+                .or(p.ray_pass)
+                .unwrap_or("left out")
+                .into(),
+        ),
         None if p.queue_state.load(Ordering::Relaxed) == NOT_QUEUED => Some("never queued".into()),
         None => Some("being made".into()),
         Some(None) => {
