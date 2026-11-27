@@ -1715,6 +1715,10 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     });
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
+    // Card memory is charged to the commit limit: never past its floor.
+    if !crate::residency::commit_room_for_card() {
+        return false;
+    }
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
     if let Some(limit) = limit {
         return filled < limit;

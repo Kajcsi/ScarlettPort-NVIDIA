@@ -130,6 +130,35 @@ pub(crate) fn refresh() {
     }
 }
 
+/// Whether the texture queue may put more on the card: memory on the card
+/// counts against Windows' commit limit one for one (measured on an RTX
+/// 4090: 4 GB of buffers in a DEFAULT heap raised the process's and the
+/// system's commit by 4 GB, with no working set). On a PC with a small
+/// paging file the card's copies used the commit up and a later allocation
+/// of 3.6 MB ended the run with 24 GB of RAM still free. The queue stops
+/// while less than `SCARLETT_CARD_COMMIT_FLOOR_MB` (6,144; 0: no floor) of
+/// commit is free; textures already on the card stay.
+pub(crate) fn commit_room_for_card() -> bool {
+    static FLOOR: OnceLock<u64> = OnceLock::new();
+    static SAID: AtomicBool = AtomicBool::new(false);
+    let floor = *FLOOR.get_or_init(|| {
+        std::env::var("SCARLETT_CARD_COMMIT_FLOOR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(6144) * MIB
+    });
+    if floor == 0 {
+        return true;
+    }
+    let commit = sample_commit(crate::host::coarse_ms());
+    let room = commit >= floor;
+    if !room && !SAID.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            available_commit_mib = commit >> 20,
+            floor_mib = floor >> 20,
+            "commit low: no more texture copies on the card until it is free again (SCARLETT_CARD_COMMIT_FLOOR_MB)"
+        );
+    }
+    room
+}
+
 pub(crate) fn headroom() -> Option<u64> {
     let bytes = HEADROOM.load(Ordering::Relaxed);
     (bytes != u64::MAX).then_some(bytes)
