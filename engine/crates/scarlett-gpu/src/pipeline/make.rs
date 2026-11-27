@@ -178,19 +178,6 @@ impl Pending {
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
-    }
-
-    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
-        self.made.get_or_init(|| {
-            // A failed translation must complete this queue entry and wake its waiters.
-            match catch_unwind(AssertUnwindSafe(build)) {
-                Ok(pipeline) => pipeline,
-                Err(_) => {
-                    tracing::warn!(shaders = ?self.shaders, "host pipeline build panicked");
-                    None
-                }
-            }
-        });
         if let Some(path) = &trace {
             use std::io::Write;
             let _trace = TRACE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -198,6 +185,18 @@ impl Pending {
                 let _ = writeln!(f, "end\t{}", self.key);
             }
         }
+    }
+
+    /// Makes the pipeline with `build` once and wakes its waiters, also when `build` panics
+    /// (then refused): a failed translation must complete its queue entry.
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
+        self.made.get_or_init(|| match catch_unwind(AssertUnwindSafe(build)) {
+            Ok(pipeline) => pipeline,
+            Err(_) => {
+                tracing::warn!(shaders = ?self.shaders, "host pipeline build panicked");
+                None
+            }
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -634,7 +633,6 @@ fn drained() {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
-<<<<<<< HEAD
             "host pipelines all made"
         );
     }
