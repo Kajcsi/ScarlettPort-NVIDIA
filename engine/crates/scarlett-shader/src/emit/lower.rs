@@ -1519,10 +1519,47 @@ pub(super) fn take_lds_region() -> bool {
 /// of its lanes ended) from hanging the card.
 const PAIR_MEET_LIMIT: u32 = 1 << 20;
 
+thread_local! {
+    /// See [`with_scc_per_host_wave`].
+    static SCC_PER_HOST_WAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The refusal of a branch the console wave takes together that this lowering cannot give
+/// the whole wave's answer for ([`Lower::wave_wide`]).
+pub(super) const WAVE_WIDE_REFUSED: Why = "a wave-wide branch where not every lane runs";
+
+/// Runs `f` with each `s_cbranch_scc0`/`scc1` on a mask operation's SCC
+/// ([`Lower::is_wave_scc_branch`]) taking its own host wave's answer, as before such
+/// branches were taken wave-wide (after 9a4aa8d3e), and such a branch not counted as a
+/// mask read as data (so it keeps no program at 64 lanes). APPROXIMATE where the two
+/// halves of a console wave answer differently. The last resort of [`super::emit`] for a
+/// program the wave-wide form refused: on a host of 32-lane waves that was every pixel,
+/// vertex and mesh program with such a branch where not every lane runs (no two host
+/// waves there can exchange), 7,108 of GTA VI's shaders, their draws dropped (scar15: a
+/// white picture at 5 fps).
+pub(super) fn with_scc_per_host_wave<R>(f: impl FnOnce() -> R) -> R {
+    let was = SCC_PER_HOST_WAVE.replace(true);
+    let r = f();
+    SCC_PER_HOST_WAVE.set(was);
+    r
+}
+
+/// Whether `p` has a branch [`with_scc_per_host_wave`] changes.
+pub(super) fn has_wave_scc_branch(p: &Program, st: &Structured) -> bool {
+    p.blocks.iter().any(|b| {
+        b.insts.last().is_some_and(|i| {
+            matches!(i.name(), "s_cbranch_scc0" | "s_cbranch_scc1")
+                && i.read(Reg::Scc).is_some_and(|s| st.scc_some.contains_key(&s))
+        })
+    })
+}
+
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     // A scalar select or branch uses the condition of the whole guest wave,
     // even when the preceding mask operation has no scalar-dword consumers.
-    if matches!(i.fields, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Valu(_))
+    // (A branch not, inside [`with_scc_per_host_wave`].)
+    let branch = matches!(i.fields, Fields::Sopp { .. }) && !SCC_PER_HOST_WAVE.get();
+    if (matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_)) || branch)
         && i.read(Reg::Scc).is_some_and(|s| st.scc_some.contains_key(&s))
     {
         return true;
@@ -4907,6 +4944,9 @@ impl<'a> Lower<'a> {
     }
 
     fn is_wave_scc_branch(&self, b: usize) -> bool {
+        if SCC_PER_HOST_WAVE.get() {
+            return false;
+        }
         let Some(last) = self.x.p.blocks[b].insts.last() else {
             return false;
         };
@@ -4926,7 +4966,7 @@ impl<'a> Lower<'a> {
     }
 
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
-        const WHY: Why = "a wave-wide branch where not every lane runs";
+        const WHY: Why = WAVE_WIDE_REFUSED;
         let any = self.x.st.wave_any.get(b).copied().flatten().ok_or("a wave-wide branch on a scalar condition")?;
         if self.exchange.is_none() && self.halves.is_none() && self.console_lanes && self.mask_data == MaskData::Console
             || self.local && self.local_any && super::loose_lds::wave_lds_loose()

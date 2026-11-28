@@ -1117,3 +1117,41 @@ fn independent_hlsl_group_any_scc_oracle() {
 
 #[path = "paired_tests.rs"]
 mod paired;
+
+/// A mask-SCC branch the wave-wide form refuses (not every lane runs it, so the two host
+/// waves of the console wave cannot meet there) lowers with each host wave's own answer
+/// inside `lower::with_scc_per_host_wave`, [`super::emit`]'s last resort: on a host of
+/// 32-lane waves the refusal dropped every pixel, vertex and mesh program with such a
+/// branch (7,108 of GTA VI's shaders), where no other form can help.
+#[test]
+fn a_refused_mask_scc_branch_lowers_per_host_wave() {
+    let native = nested_mask_scc(SccUse::Branch);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+    let st = structure::structure(&p).expect("structure");
+    assert!(lower::has_wave_scc_branch(&p, &st));
+    let branch = p
+        .blocks
+        .iter()
+        .filter_map(|b| b.insts.last())
+        .find(|i| i.name() == "s_cbranch_scc0")
+        .expect("the mask-SCC branch");
+    assert!(lower::reads_mask_as_data(&st, branch), "the branch asks the whole console wave");
+    assert!(
+        !lower::with_scc_per_host_wave(|| lower::reads_mask_as_data(&st, branch)),
+        "per host wave, the branch keeps no program at 64 lanes"
+    );
+    lower::take_needs();
+    let wave_wide = lowered(&native, &p, &HashSet::new());
+    assert!(
+        matches!(wave_wide, Err(ShaderError::Unsupported { what, .. }) if what == lower::WAVE_WIDE_REFUSED),
+        "{:?}",
+        wave_wide.err()
+    );
+    lower::take_needs();
+    let per_host = lower::with_scc_per_host_wave(|| lowered(&native, &p, &HashSet::new()));
+    lower::take_needs();
+    let shader = per_host.expect("each host wave's own answer lowers");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation");
+    }
+}
