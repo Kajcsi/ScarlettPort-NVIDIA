@@ -367,6 +367,9 @@ struct Lower<'a> {
     /// With `exchange`: the wave ORs that only steer a loop over each lane's own bits, which
     /// a host wave takes over its own lanes wherever they stand ([`super::own_bits`]).
     own_bits: super::own_bits::OwnBits,
+    /// With halves: the branches on "some lane is left" closing loops each lane may leave
+    /// on its own ([`super::own_loops`]), taken by the lane's own bit.
+    own_loops: HashSet<usize>,
     /// The console lane (0..63) of this thread, made in the entry block.
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
@@ -482,7 +485,7 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
 /// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
 /// not post-dominate it, which only some lanes run. Not the branches the wave takes together
 /// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
-fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
+pub(super) fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (b, e) in st.exits.iter().enumerate() {
@@ -1069,7 +1072,7 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
 
 /// The start an LDS dword needs for the atomic `name` to fold values into it: `u32::MAX` for a
 /// minimum or an AND, 0 for a maximum, sum, OR or XOR, ... `None`: not such a fold.
-fn fold_identity(name: &str) -> Option<u32> {
+pub(super) fn fold_identity(name: &str) -> Option<u32> {
     Some(match name.replace("_rtn", "").as_str() {
         "ds_min_u32" | "ds_and_b32" => u32::MAX,
         "ds_max_u32" | "ds_add_u32" | "ds_or_b32" | "ds_xor_b32" => 0,
@@ -1824,6 +1827,8 @@ impl<'a> Lower<'a> {
         // console lanes in a group of several host waves: the LDS dword of `wave_base`'s counter
         let mut ticket: Option<u32> = None;
         let mut pair_meet: Option<u32> = None;
+        // with halves: loops each lane may leave on its own (`own_loops`)
+        let mut own_loops = super::own_loops::OwnLoops::default();
         let mut paired = None;
         // `SCARLETT_WAVE32_FIXES=1` (`loose_lds`): `ds_bpermute_b32` within 32-lane halves, and
         // D3D12's 32 KiB (8,192 dwords) of group-shared memory kept to
@@ -1895,7 +1900,31 @@ impl<'a> Lower<'a> {
                         matches!(i.fields, Fields::Ds { .. })
                             && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
                     };
-                    if let Some(all) = all_lane_blocks(x.st) {
+                    if let Some(every) = all_lane_blocks(x.st) {
+                        // Loops each lane may leave on its own: not every lane runs their
+                        // blocks (the latch included), so the host waves meet only around
+                        // them; unless that leaves LDS accesses no meetings can order.
+                        let mut all = every.clone();
+                        if x.native.wave64 && super::own_loops::on() {
+                            own_loops = super::own_loops::find(p, x.st, std::env::var_os("SCARLETT_WAVE_WHY").is_some());
+                            for &b in &own_loops.blocks {
+                                all[b] = false;
+                            }
+                            let in_all = |all: &[bool]| {
+                                p.blocks.iter().enumerate().all(|(b, blk)| {
+                                    blk.insts.iter().all(|inst| !lds(inst) || all.get(b).copied().unwrap_or(false))
+                                })
+                            };
+                            if !own_loops.latches.is_empty()
+                                && s.lds_dwords > 0
+                                && group > 32
+                                && !in_all(&all)
+                                && lds_meetings(p, x.st, &all).is_none()
+                            {
+                                own_loops = Default::default();
+                                all = every;
+                            }
+                        }
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
                             blk.insts.iter().all(|inst| {
                                 !lds(inst) || all.get(b).copied().unwrap_or(false)
@@ -2163,6 +2192,7 @@ impl<'a> Lower<'a> {
                 }
                 _ => HashSet::new(),
             },
+            own_loops: if halves.is_some() { own_loops.latches } else { HashSet::new() },
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
                     super::own_bits::find(p, x.st, std::env::var_os("SCARLETT_WAVE_WHY").is_some())
@@ -4944,7 +4974,7 @@ impl<'a> Lower<'a> {
     }
 
     fn is_wave_scc_branch(&self, b: usize) -> bool {
-        if SCC_PER_HOST_WAVE.get() {
+        if SCC_PER_HOST_WAVE.get() || self.own_loops.contains(&b) {
             return false;
         }
         let Some(last) = self.x.p.blocks[b].insts.last() else {
