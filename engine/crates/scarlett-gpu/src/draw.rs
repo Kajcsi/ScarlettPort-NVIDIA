@@ -1652,9 +1652,12 @@ impl State {
             return;
         }
         self.host_targets = Some(now);
-        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
-        let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
-        // SAFETY: an open list; the views were just made.
+        // Held until the targets are recorded below ([`crate::host::HeldView`]).
+        let held: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
+        let held_dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
+        let rtvs: Vec<_> = held.iter().map(|view| view.handle).collect();
+        let dsv = held_dsv.as_ref().map(|view| view.handle);
+        // SAFETY: an open list; the views were just made and are held.
         unsafe {
             list.list.OMSetRenderTargets(
                 rtvs.len() as u32,
