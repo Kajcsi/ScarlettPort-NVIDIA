@@ -299,3 +299,140 @@ fn lds_shared_in_a_lane_branch_gives_the_consoles_result_on_warp() {
         eprintln!("ran on WARP: {threads} threads, the console's result in every case");
     }
 }
+
+/// A loop each lane runs for its own count, closed as the console's compiler closes it
+/// ([`super::own_loops`]): the lanes left are a mask, each pass starts by taking EXEC within
+/// it, the lanes done leave it, and the wave goes round while it has a bit. Thread t adds 1
+/// to LDS dword `t & 3` `(t & 7) + 1` times, then the group stores LDS dwords 0..127 (zeroed
+/// first) to `out`. 128 threads: two console waves.
+fn own_loop() -> NativeProgram {
+    let mut words = vec![
+        0xBE80_047E, // s_mov_b64 s[0:1], exec
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0           (4t)
+        0x7E06_0280, // v_mov_b32 v3, 0
+    ];
+    words.extend(ds(13, 0, 1, 3)); // ds_write_b32 v1, v3       lds[t] = 0
+    words.extend([
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0x3626_0087, // v_and_b32 v19, 7, v0
+        0x4A26_2681, // v_add_nc_u32 v19, 1, v19          (the lane's count)
+        0x3610_0083, // v_and_b32 v8, 3, v0
+        0x3410_1082, // v_lshlrev_b32 v8, 2, v8           (4 (t & 3))
+        0x7E12_0281, // v_mov_b32 v9, 1
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0xBE84_047E, // s_mov_b64 s[4:5], exec            (the lanes left)
+        0xBF82_0002, // s_branch to the pass
+        0x87FE_0406, // s_and_b64 exec, s[6:7], s[4:5]    (back here: the lanes left)
+        0xBF80_0000, // s_nop 0
+        0x4A0C_0C81, // the pass: v_add_nc_u32 v6, 1, v6
+        0xBE86_047E, // s_mov_b64 s[6:7], exec
+    ]);
+    words.extend(ds(0, 0, 8, 9)); // ds_add_u32 v8, v9
+    words.extend([
+        0x7DA4_2706, // v_cmpx_eq_u32 exec, v6, v19       (the lanes done)
+        0x8A84_7E04, // s_andn2_b64 s[4:5], s[4:5], exec  (SCC: some lane is left)
+        0xBF85_FFF7, // s_cbranch_scc1 back
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+    ]);
+    words.extend(ds(54, 3, 1, 0)); // ds_read_b32 v3, v1
+    words.push(0xBF8C_C07F); // s_waitcnt lgkmcnt(0)
+    words.extend(store_at(3, 1)); //                      out[t] = lds[t]
+    native(&words, true, 128, 1024)
+}
+
+/// [`own_loop`]'s `out[t]`: the sum of `(u & 7) + 1` over the threads u with `u & 3 == t`.
+fn own_loop_expected(t: u32) -> u32 {
+    (0..128u32).filter(|u| u & 3 == t).map(|u| (u & 7) + 1).sum()
+}
+
+/// [`widened`] with [`super::own_loops`] on or off.
+fn widened_own(native: &NativeProgram, own: bool) -> (lower::Lowered, HashSet<usize>) {
+    let was = super::own_loops::TEST_ON.replace(Some(own));
+    let r = widened(native, true);
+    super::own_loops::TEST_ON.set(was);
+    r
+}
+
+#[test]
+fn a_loop_each_lane_leaves_on_its_own_runs_without_meetings_inside() {
+    let native = own_loop();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let found = super::own_loops::find(&p, &st, true);
+    assert_eq!(found.latches.len(), 1, "the loop's branch is found");
+    let (on, wide_on) = widened_own(&native, true);
+    assert_eq!(on.wave_size, Some(32), "waves of 32");
+    assert!(wide_on.is_empty(), "nothing taken wave-wide");
+    validate(&on.dxil, "own loop");
+    let (off, _) = widened_own(&native, false);
+    assert_eq!(off.wave_size, Some(32), "waves of 32 without it too");
+    assert_ne!(on.dxil, off.dxil, "the branch by each lane's own bit");
+    assert!(on.dxil.len() < off.dxil.len(), "no exchange in the loop: {} vs {} bytes", on.dxil.len(), off.dxil.len());
+}
+
+#[test]
+fn a_loop_whose_pass_does_not_leave_the_lanes_done_out_keeps_the_wave_wide_branch() {
+    // the same loop without the s_and_b64 that takes EXEC within the lanes left: a lane that
+    // is done runs the later passes too (with all of EXEC), so the wave's branch stays
+    let mut native = own_loop();
+    let and_exec = 0x87FE_0406u32.to_le_bytes();
+    let nop = 0xBF80_0000u32.to_le_bytes();
+    let at = native.code.windows(4).position(|w| w == and_exec).expect("the s_and_b64");
+    native.code[at..at + 4].copy_from_slice(&nop);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    assert!(super::own_loops::find(&p, &st, true).latches.is_empty());
+}
+
+#[test]
+fn a_loop_each_lane_leaves_on_its_own_gives_the_consoles_result_on_warp() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(true) else {
+        eprintln!("no SM 6.6 WARP device; not run");
+        return;
+    };
+    let native = own_loop();
+    for own in [true, false] {
+        let (r, _) = widened_own(&native, own);
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: r.dxil,
+            user_data: r.user_data,
+            samplers: r.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: r.root_cbvs,
+            root_srvs: r.root_srvs,
+            root_uavs: r.root_uavs,
+            root_indexed_views: Vec::new(),
+            half_views: r.half_views,
+        };
+        let (root, pso) = match host.compute_pipeline(&shader) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("WARP does not take the waves-of-32 program: {e}; not run");
+                return;
+            }
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(128)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        for t in 0..128u32 {
+            let want = if t < 4 { own_loop_expected(t) } else { 0 };
+            assert_eq!(out[0][t as usize], want, "own loops {own}: thread {t}");
+        }
+        eprintln!("ran on WARP (own loops {own}): the console's result");
+    }
+}

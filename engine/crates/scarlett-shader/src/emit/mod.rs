@@ -96,6 +96,7 @@ mod lds_setup_tests;
 mod loose_lds;
 mod lower;
 mod own_bits;
+mod own_loops;
 #[cfg(all(test, windows))]
 mod permlane_tests;
 mod rect;
