@@ -32,9 +32,41 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
-/// Render target views live only until their command is recorded, so a
-/// ring of host descriptors is enough.
+/// Host render target and depth view slots ([`Host::rtv`], [`Host::dsv`]).
+/// A view lives only until its command is recorded, and its slot is held
+/// until then ([`HeldView`]); past these, a heap of one view is made for it.
 const RTV_RING: u32 = 1024;
+
+/// A host render target or depth view whose slot is held until this is
+/// dropped: keep it until the command that names it is recorded.
+///
+/// After RAZDA4A XEN's fork (7e9c3b90, upstream VIctory #2844,
+/// GPL-3.0-or-later): the views were a ring that each thread took the next
+/// slot of, so with many lists recording at once a thread held up between
+/// making its view and recording its command could find the slot made over
+/// by others that had gone round the ring meanwhile, and draw into another
+/// target.
+pub(crate) struct HeldView<'a> {
+    pub(crate) handle: D3D12_CPU_DESCRIPTOR_HANDLE,
+    held: Held<'a>,
+}
+
+enum Held<'a> {
+    /// A slot of the host's heap, back in its free list when dropped.
+    Slot(&'a Mutex<Vec<u32>>, u32),
+    /// A heap of one view made for it (every slot was held).
+    Own(#[allow(dead_code)] ID3D12DescriptorHeap),
+    /// A ring slot not held (no heap of one view could be made).
+    Unheld,
+}
+
+impl Drop for HeldView<'_> {
+    fn drop(&mut self) {
+        if let Held::Slot(free, slot) = self.held {
+            free.lock().unwrap_or_else(|e| e.into_inner()).push(slot);
+        }
+    }
+}
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -49,6 +81,9 @@ pub(crate) struct Host {
     dsvs: ID3D12DescriptorHeap,
     dsv_size: u32,
     next_dsv: AtomicU32,
+    /// The free slots of `dsvs` and `rtvs` ([`HeldView`]).
+    free_dsvs: Mutex<Vec<u32>>,
+    free_rtvs: Mutex<Vec<u32>>,
     /// With `SCARLETT_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
@@ -1146,6 +1181,8 @@ fn create() -> windows::core::Result<Host> {
             dsvs,
             dsv_size,
             next_dsv: AtomicU32::new(0),
+            free_dsvs: Mutex::new((0..RTV_RING).rev().collect()),
+            free_rtvs: Mutex::new((0..RTV_RING).rev().collect()),
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
@@ -1770,7 +1807,7 @@ fn record_plane_pass(
                 list.SetGraphicsRootSignature(&root);
                 list.SetPipelineState(&pipeline);
                 list.SetGraphicsRootDescriptorTable(0, gpu);
-                list.OMSetRenderTargets(0, None, false, Some(&target));
+                list.OMSetRenderTargets(0, None, false, Some(&target.handle));
                 list.RSSetViewports(&[D3D12_VIEWPORT {
                     TopLeftX: 0.0,
                     TopLeftY: 0.0,
@@ -6887,39 +6924,84 @@ impl Host {
         first_error
     }
 
-    /// A host render target view of `resource`, valid until it is recorded.
+    /// A slot for a view of `kind`: a free one of `heap` (held until the
+    /// view is dropped), else a heap of its own, else the next of the ring.
+    fn held_slot<'a>(
+        &'a self,
+        heap: &ID3D12DescriptorHeap,
+        size: u32,
+        free: &'a Mutex<Vec<u32>>,
+        next: &AtomicU32,
+        kind: D3D12_DESCRIPTOR_HEAP_TYPE,
+    ) -> HeldView<'a> {
+        let at = |slot: u32| {
+            // SAFETY: a slot of our heap.
+            let mut handle = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+            handle.ptr += (slot * size) as usize;
+            handle
+        };
+        if let Some(slot) = free.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+            return HeldView { handle: at(slot), held: Held::Slot(free, slot) };
+        }
+        static SPILLED: AtomicU32 = AtomicU32::new(0);
+        if SPILLED.fetch_add(1, Ordering::Relaxed) == 0 {
+            tracing::info!(?kind, "every held render target or depth view slot is taken: views get heaps of their own (counted once)");
+        }
+        // SAFETY: a plain description of a CPU-only heap.
+        let own: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+            self.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: kind,
+                NumDescriptors: 1,
+                ..Default::default()
+            })
+        };
+        match own {
+            Ok(own) => {
+                // SAFETY: the heap is kept in the view.
+                let handle = unsafe { own.GetCPUDescriptorHandleForHeapStart() };
+                HeldView { handle, held: Held::Own(own) }
+            }
+            Err(error) => {
+                static FAILED: AtomicU32 = AtomicU32::new(0);
+                if FAILED.fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::warn!(?kind, %error, "no heap for a render target or depth view: a ring slot not held (counted once)");
+                }
+                let slot = next.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+                HeldView { handle: at(slot), held: Held::Unheld }
+            }
+        }
+    }
+
+    /// A host render target view of `resource`, held until the returned
+    /// view is dropped: keep it until the command is recorded.
     pub(crate) fn rtv(
         &self,
         resource: Option<&ID3D12Resource>,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-        // SAFETY: a slot of our heap and a live resource, or none with a
+    ) -> HeldView<'_> {
+        let view = self.held_slot(&self.rtvs, self.rtv_size, &self.free_rtvs, &self.next_rtv, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        // SAFETY: a held slot and a live resource, or none with a
         // description (a typed null view).
         unsafe {
-            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.rtv_size) as usize;
             self.device
-                .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
-            handle
+                .CreateRenderTargetView(resource, desc.map(|d| d as *const _), view.handle);
         }
+        view
     }
 
-    /// A host depth view of `resource`, valid until it is recorded.
+    /// A host depth view of `resource`, held as [`Host::rtv`]'s.
     pub(crate) fn dsv(
         &self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-        // SAFETY: a slot of our heap and a live resource.
+    ) -> HeldView<'_> {
+        let view = self.held_slot(&self.dsvs, self.dsv_size, &self.free_dsvs, &self.next_dsv, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        // SAFETY: a held slot and a live resource.
         unsafe {
-            let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.dsv_size) as usize;
             self.device
-                .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
-            handle
+                .CreateDepthStencilView(resource, desc.map(|d| d as *const _), view.handle);
         }
+        view
     }
 
     /// 1-descriptor shader-visible CBV/SRV/UAV fallback heap for directly-indexed root signatures.
