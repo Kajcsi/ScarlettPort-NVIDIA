@@ -25,6 +25,46 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+/// Whether `depth` is the depth plane of the subresources `stencil` shows
+/// the stencil plane of: one texture (or one the title placed), a 2D view of
+/// plane 1 in X32_TYPELESS_G8X24_UINT or X24_TYPELESS_G8_UINT against a 2D
+/// view of plane 0 in the matching depth format, the same levels and array
+/// slice, default component order.
+///
+/// After TaynanGT/Vice-Tay PR 206 (Taynan Piza, GPL-3.0-or-later, reported by
+/// Garu667): the diffuse resolve can bind its depth's stencil plane at the
+/// usual place, and the depth view it reads elsewhere is the one to use.
+fn is_depth_companion(stencil: &View, depth: &View) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, DXGI_FORMAT_X24_TYPELESS_G8_UINT,
+        DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
+    };
+    let (stencil_desc, depth_desc): (&[u32], &[u32]) = match (stencil, depth) {
+        (View::Shader(a, Some(stencil)), View::Shader(b, Some(depth))) if a == b && *a != 0 => (stencil, depth),
+        (View::Placed(false, _, stencil_desc), View::Placed(false, _, depth_desc))
+            if crate::descriptor::host::same_placed_texture(stencil, depth) =>
+        {
+            (stencil_desc, depth_desc)
+        }
+        _ => return false,
+    };
+    let format = |view: &[u32]| DXGI_FORMAT(crate::resource::pc_format(view[0]) as i32);
+    let expected = match format(stencil_desc) {
+        DXGI_FORMAT_X32_TYPELESS_G8X24_UINT => DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+        DXGI_FORMAT_X24_TYPELESS_G8_UINT => DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+        _ => return false,
+    };
+    let texture_2d = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+    stencil_desc[1] == texture_2d
+        && depth_desc[1] == texture_2d
+        && stencil_desc[6] == 1
+        && depth_desc[6] == 0
+        && format(depth_desc) == expected
+        && depth_desc[2] == D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+        && stencil_desc[4..6] == depth_desc[4..6]
+        && stencil_desc[7] == depth_desc[7]
+}
+
 /// Shader interface metadata shared by every pipeline variant and draw.
 pub(crate) struct TablePlan {
     groups: Vec<TableGroup>,
@@ -4003,8 +4043,35 @@ impl State {
         // walls of rooms black, as the title has them without rays (and the
         // probes' old memory in blocks).
         let mut flat = false;
+        // Where the usual place names a stencil plane, the depth plane of the
+        // same texture the dispatch reads at another place (Vice-Tay PR 206),
+        // before any depth of the picture's size: that may be another one.
+        let view_at = |(slot, offset): (u8, u32)| {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table.checked_add(u64::from(offset) * 4)?)
+        };
+        let companion = |at: (u8, u32)| {
+            let stencil = view_at(at)?;
+            t.used
+                .iter()
+                .filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Table)
+                .map(|u| (u.slot, u.table_offset_dwords))
+                .filter(|place| *place != at)
+                .find(|place| view_at(*place).is_some_and(|depth| is_depth_companion(&stencil, &depth)))
+                .and_then(|place| entry(ResourceType::Srv, place))
+        };
         let depth = match role {
             Role::Resolve => usual_depth(DEPTH)
+                .or_else(|| {
+                    let found = companion(DEPTH);
+                    static COMPANION: AtomicU64 = AtomicU64::new(0);
+                    if found.is_some() && COMPANION.fetch_add(1, Ordering::Relaxed) == 0 {
+                        tracing::info!(target: "scarlett_gpu::ambient", "the diffuse stand-in takes the depth plane of the stencil view at its usual place (counted once)");
+                    }
+                    found
+                })
                 .or_else(|| {
                     let size = image.as_ref().map(|(d, _)| (d.Width, d.Height));
                     scan(ResourceType::Srv, &|d| depth_like(d) && size == Some((d.Width, d.Height)))
@@ -6040,6 +6107,21 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 mod tests {
     use super::{AfterLook, after_unchanged_look, next_texture_recheck, staging_budget_per_frame};
 
+    #[test]
+    fn the_reported_stencil_view_requires_its_matching_depth_plane() {
+        use super::{View, is_depth_companion};
+        let words = [22, 4, 5768, 0, 0, 1, 1, 0, 0, 0];
+        let stencil = View::Shader(1, Some(words));
+        let mut depth = words;
+        depth[0] = 21;
+        depth[6] = 0;
+        assert!(!is_depth_companion(&stencil, &stencil));
+        assert!(is_depth_companion(&stencil, &View::Shader(1, Some(depth))));
+        assert!(!is_depth_companion(&stencil, &View::Shader(2, Some(depth))));
+        depth[4] = 1;
+        assert!(!is_depth_companion(&stencil, &View::Shader(1, Some(depth))));
+    }
+
     /// A texture whose memory is shown at other addresses too is looked at
     /// for as long as it stays, parked between its looks at the longest wait;
     /// whether it is shown elsewhere is asked only when its looks would end.
@@ -6219,6 +6301,9 @@ mod shared_table_tests {
         let p = state.tables_with_extents(&list, &ps, false, &extents);
         assert_eq!(&*v, &*p);
         assert_ne!(v[0].1, u32::MAX);
+        // (With `SCARLETT_DYNAMIC_SLAB` the slots sit in the list's slab
+        // until it is flushed: its used ones then become the list's.)
+        state.flush_slab();
         assert_eq!(state.dynamic.len(), 1);
         assert_eq!(state.dynamic[0].3, 128);
 
