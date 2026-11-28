@@ -159,10 +159,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
-    // Only the walls trace reads the list, so it isn't kept without it.
-    if walls_trace() > 0 {
-        WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
-    }
+    // Kept with or without the walls trace: a failed request names its file
+    // by it (`source_path`). By address, so an address used again names the
+    // file opened last and the map holds no more entries than addresses.
+    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).insert(file as usize, kept);
     put(out, file)
 }
 
@@ -685,7 +685,8 @@ fn walls_trace() -> u8 {
 /// The files opened, by the address of our file object, with their paths
 /// (for the walls trace and failed requests: a request names its file by
 /// that address).
-static WALLS_FILES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+static WALLS_FILES: Mutex<std::collections::BTreeMap<usize, String>> =
+    Mutex::new(std::collections::BTreeMap::new());
 
 /// The path of the file `request` reads from: "memory" for a source in
 /// memory, "?" for a file object we did not open.
@@ -695,8 +696,7 @@ fn source_path(request: &Request) -> String {
     }
     let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
     let source = request.source as usize;
-    // From the back: an address used again names the file opened last.
-    files.iter().rev().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
+    files.get(&source).map_or_else(|| "?".to_string(), Clone::clone)
 }
 
 /// What a player is told, once per run, when a game file's zlib data does
