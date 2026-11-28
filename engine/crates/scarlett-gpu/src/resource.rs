@@ -3212,6 +3212,8 @@ fn forget_placed() {
             let keys = placed_in(&map, &ranges);
             keys.into_iter().filter_map(|key| map.remove(&key)).collect()
         };
+        // (The filler-twin statistics: diagnostics builds only.)
+        #[cfg(feature = "diagnostics")]
         {
             let mut raw = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
             let keys: Vec<(u64, [u32; 14])> = ranges
