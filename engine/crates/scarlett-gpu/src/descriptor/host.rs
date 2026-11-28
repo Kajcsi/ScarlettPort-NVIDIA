@@ -139,7 +139,6 @@ impl DynamicBits {
         Self { words, len }
     }
 
-    #[cfg(any(feature = "diagnostics", test))]
     fn get(&self, index: usize) -> Option<bool> {
         (index < self.len).then(|| (self.words[index / 64] >> (index % 64)) & 1 != 0)
     }
