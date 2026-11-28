@@ -9205,6 +9205,23 @@ fn wide_textures() -> bool {
     *ON.get_or_init(|| std::env::var_os("SCARLETT_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh())
 }
 
+/// Whether a flush's due textures are refreshed in the same pass over the
+/// threads as its copies' refreshes (`SCARLETT_FLUSH_TOGETHER=0` turns it
+/// off), as [`Batch::refresh_spans`] does.
+///
+/// Each of a submission's 40-odd flushes a frame refreshed its textures,
+/// waited for every thread, then refreshed its copies in a second pass:
+/// while a large texture was read, hashed and detiled the other threads had
+/// nothing to do (scar14: 17.7 ms of the submitting thread's time a frame in
+/// flushes for 13.6 ms of texture work over all threads, the card idle 34 of
+/// 36 ms behind it). A texture's refresh reads title memory and writes its
+/// staging buffer, a copy's reads title memory and writes the copy: nothing
+/// of each other's.
+fn flush_together() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SCARLETT_FLUSH_TOGETHER").is_none_or(|v| v != "0") && wide_textures())
+}
+
 /// `SCARLETT_FILLS_HERE=1` (off by default; live with `SCARLETT_AB`): a
 /// submission's fills of upload memory are copied on the submitting thread,
 /// in order, never handed to the `scarlett-wide` threads. The bytes and the
@@ -9544,7 +9561,10 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        self.refresh_textures();
+        // (With the copies' refreshes, in `flush_all`, if there are enough.)
+        if !(flush_together() && crate::watch::light() && self.refreshes.len() >= 4) {
+            self.refresh_textures();
+        }
         self.index.clear();
         if self.refreshes.is_empty() {
             return;
@@ -9580,6 +9600,12 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
+        // The textures `flush` left for the pass below ([`flush_together`]),
+        // done first here if there is no such pass after all.
+        if !self.due.is_empty() && !(light && wide_refresh() && self.refreshes.len() >= 4) {
+            self.refresh_textures();
+        }
+        let due = std::mem::take(&mut self.due);
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
         let ahead = self.refreshes.len() > 1;
@@ -9607,7 +9633,17 @@ impl Batch {
                 let refreshes = std::mem::take(&mut self.refreshes);
                 let check = refreshes.len() > FEW || beside;
                 let grain = if refreshes.len() < 64 { 1 } else { 8 };
-                crate::shadow::wide_ranges(refreshes.len(), grain, move |range| {
+                // The textures first, each a piece of its own (they are the
+                // longer ones), then the copies' refreshes `grain` at a time.
+                let textures = due.len();
+                let before_textures = PREPARING[2].load(Ordering::Relaxed);
+                let _textures = (textures != 0).then(|| crate::timeline::span("textures brought up to date"));
+                crate::shadow::wide_each(textures + refreshes.len().div_ceil(grain), move |i| {
+                    let Some(i) = i.checked_sub(textures) else {
+                        due[i].refresh();
+                        return;
+                    };
+                    let range = i * grain..((i + 1) * grain).min(refreshes.len());
                     let (mut us, mut bytes) = (0, 0);
                     #[cfg(feature = "diagnostics")]
                     let mut unchanged = 0;
@@ -9634,6 +9670,12 @@ impl Batch {
                         FLUSHES[2].fetch_add(unchanged, Ordering::Relaxed);
                     }
                 });
+                // The time counted is the time it took (below, all as the
+                // copies'), not the threads' sum.
+                if textures != 0 {
+                    let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before_textures);
+                    PREPARING[2].fetch_sub(summed, Ordering::Relaxed);
+                }
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                     .refreshes
