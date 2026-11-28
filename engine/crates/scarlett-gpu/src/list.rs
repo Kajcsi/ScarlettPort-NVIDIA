@@ -289,7 +289,7 @@ struct Pool {
 /// profile cpu-1). `SCARLETT_LIST_IDLE_MOST=N`: N instead of 512, from 16 to
 /// 4096.
 #[cfg(windows)]
-fn idle_most() -> usize {
+fn idle_most_set() -> usize {
     static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
         let set = std::env::var("SCARLETT_LIST_IDLE_MOST")
@@ -335,6 +335,50 @@ fn trim_count(low: usize, floor: usize, per_tick: usize) -> usize {
     low.saturating_sub(floor).min(per_tick)
 }
 
+/// The most host lists kept idle while the PC's memory or Windows' commit
+/// is short ([`crate::residency::pressured`], [`crate::residency::commit_tight`]):
+/// each keeps its allocators and buffers, which [`IDLE_BYTES`] does not
+/// count (some 0.7 MB of commit a list, run 69: up to 350 MB for 512).
+#[cfg(windows)]
+const IDLE_TIGHT: usize = 32;
+
+/// How many host lists may stay idle now.
+#[cfg(windows)]
+fn idle_most() -> usize {
+    idle_most_for(crate::residency::pressured() || crate::residency::commit_tight())
+}
+
+#[cfg(windows)]
+fn idle_most_for(tight: bool) -> usize {
+    if tight { IDLE_TIGHT.min(idle_most_set()) } else { idle_most_set() }
+}
+
+/// Host lists kept idle now, for the memory line.
+#[cfg(windows)]
+pub(crate) fn idle_lists() -> usize {
+    IDLE.lock().unwrap_or_else(|e| e.into_inner()).lists.len()
+}
+
+/// Under memory pressure: the idle host lists past [`IDLE_TIGHT`] go (they
+/// have run and were reset; nothing names them).
+#[cfg(windows)]
+pub(crate) fn trim_idle() {
+    let gone: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.lists.len() <= IDLE_TIGHT {
+            return;
+        }
+        // The oldest first: `fresh_list` takes from the end.
+        let over = idle.lists.len() - IDLE_TIGHT;
+        let gone: Vec<Idle> = idle.lists.drain(..over).collect();
+        idle.bytes -= gone.iter().map(|g| g.1).sum::<u64>();
+        idle.low = idle.low.min(idle.lists.len());
+        gone
+    };
+    // Freed outside the lock.
+    drop(gone);
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `SCARLETT_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -375,7 +419,8 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).lists.len() >= idle_most() {
+        let most = idle_most();
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).lists.len() >= most {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -383,7 +428,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.lists.len() < idle_most() && idle.bytes + bytes <= IDLE_BYTES {
+        if idle.lists.len() < most && idle.bytes + bytes <= IDLE_BYTES {
             idle.lists.push(Idle(host, bytes));
             idle.bytes += bytes;
         }
@@ -2532,6 +2577,13 @@ mod tests {
         lists.pop();
         low = low.min(lists.len());
         assert_eq!(low, lists.len());
+    }
+
+    #[test]
+    fn idle_lists_kept_short_under_memory_pressure() {
+        assert_eq!(idle_most_for(false), idle_most_set());
+        assert_eq!(idle_most_for(true), IDLE_TIGHT);
+        assert!(idle_most_for(true) <= idle_most_for(false));
     }
 
     #[test]
