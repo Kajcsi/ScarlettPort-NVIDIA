@@ -102,6 +102,10 @@ unsafe fn patch_sse4a(at: usize, code: &[u8], what: ConsoleOnly, len: usize) -> 
         return false;
     }
     let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: by the caller.
+    if !unsafe { still(at, &code[..5]) } {
+        return false;
+    }
     if stubs.is_none() {
         *stubs = near(at).map(|place| (place, 0));
     }
@@ -186,6 +190,10 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
         return false;
     };
     let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: by the caller.
+    if !unsafe { still(at, &[a, b, c, d, e]) } {
+        return false;
+    }
     if stubs.is_none() {
         *stubs = near(at).map(|place| (place, 0));
     }
@@ -220,9 +228,46 @@ fn with_patch(word: u128, at: usize, patch: &[u8]) -> Option<u128> {
     Some(u128::from_le_bytes(bytes))
 }
 
+/// Whether the bytes at `at` are still `code` (another thread's fault there may have replaced
+/// them since this one's was read: a stub made for them would be one nothing jumps to).
+///
+/// # Safety
+/// `at` is in code that stays mapped.
+unsafe fn still(at: usize, code: &[u8]) -> bool {
+    // SAFETY: by the caller; read as volatile, as other threads may change them.
+    code.iter().enumerate().all(|(i, &b)| unsafe { std::ptr::read_volatile((at + i) as *const u8) } == b)
+}
+
 /// One thread at a time changes code: a second one would take the first one's loosened
-/// protection for the page's own.
-static PATCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// protection for the page's own. Held with it: every place changed, and what it was changed to.
+static PATCHING: std::sync::Mutex<std::collections::BTreeMap<usize, ([u8; 16], usize)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn patching() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<usize, ([u8; 16], usize)>> {
+    PATCHING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Remembers that the place `at` now holds `new` (with [`patching`] held, as the change is made).
+fn changed(places: &mut std::collections::BTreeMap<usize, ([u8; 16], usize)>, at: usize, new: &[u8]) {
+    let mut bytes = [0u8; 16];
+    let n = new.len().min(16);
+    bytes[..n].copy_from_slice(&new[..n]);
+    places.insert(at, (bytes, n));
+}
+
+/// Whether the place `at`, where an instruction faulted that the bytes `seen` read there since
+/// are not, was changed by another thread in between: it raised the same exception and replaced
+/// the instruction before this one's bytes were read (or while they were, the store halfway
+/// through the read). Run again, the place does what the replacement does. (Threads that met
+/// the instruction at the same moment are that common: run scar17 ended on one.)
+///
+/// # Safety
+/// `seen.len()` bytes at `at` are readable.
+unsafe fn changed_since(at: usize, seen: &[u8]) -> bool {
+    let places = patching();
+    // SAFETY: by the caller; no store is halfway through now, as stores are made holding the lock.
+    let now: Vec<u8> = (0..seen.len()).map(|i| unsafe { std::ptr::read_volatile((at + i) as *const u8) }).collect();
+    now != seen || places.get(&at).is_some_and(|&(bytes, n)| now.len() >= n && now[..n] == bytes[..n])
+}
 
 /// Replaces the bytes at `at`, which are `was`, by `patch`, in one store that other threads
 /// see whole: whether they are replaced now (not where they cross 16 aligned bytes, or the page
@@ -231,16 +276,26 @@ static PATCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// # Safety
 /// `at` is in code that stays mapped, and `patch` does for it what `was` does.
 unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool {
+    // SAFETY: by the caller.
+    unsafe { patch_bytes(at, &was, &patch) }
+}
+
+/// [`patch`] for bytes whose number is known as the program runs.
+///
+/// # Safety
+/// As [`patch`]; `was` and `patch` are as long.
+unsafe fn patch_bytes(at: usize, was: &[u8], patch: &[u8]) -> bool {
     use std::sync::atomic::Ordering::SeqCst;
     use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    if (at & 15) + N > 16 || !std::is_x86_feature_detected!("cmpxchg16b") {
+    let n = patch.len();
+    if was.len() != n || (at & 15) + n > 16 || !std::is_x86_feature_detected!("cmpxchg16b") {
         return false;
     }
-    let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut places = patching();
     let word = (at & !15) as *mut u128;
-    let here = (at & 15)..(at & 15) + N;
+    let here = (at & 15)..(at & 15) + n;
     let mut old = 0u32;
     // SAFETY: the aligned 16 bytes around the instruction lie in one page of mapped code, made
     // writable for the store and put back; the processor has the instruction (asked above).
@@ -256,11 +311,12 @@ unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool
                 // (Another thread's fault at the same place: done already.)
                 break true;
             }
-            let Some(new) = (bytes == was).then(|| with_patch(now, at, &patch)).flatten() else {
+            let Some(new) = (bytes == was).then(|| with_patch(now, at, patch)).flatten() else {
                 break false;
             };
             let there = std::arch::x86_64::cmpxchg16b(word, now, new, SeqCst, SeqCst);
             if there == now {
+                changed(&mut places, at, patch);
                 break true;
             }
             now = there;
@@ -426,9 +482,16 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             n
         }
     };
-    // SAFETY: `n` bytes at `rip` are readable.
-    let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
-    let Some((what, len)) = decode::decode(code) else { return 0 };
+    // A copy: another thread's fault at the same place may replace the bytes while this one
+    // looks at them (and what they were is what a patch must find there).
+    let mut copy = [0u8; 16];
+    // SAFETY: `n` (at most 16) bytes at `rip` are readable.
+    unsafe { std::ptr::copy_nonoverlapping(rip as *const u8, copy.as_mut_ptr(), n) };
+    let code = &copy[..n];
+    let Some((what, len)) = decode::decode(code) else {
+        // SAFETY: as above.
+        return if unsafe { changed_since(rip, code) } { CONTINUE_EXECUTION } else { 0 };
+    };
     static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
     if let Ok(mut seen) = SEEN.lock()
         && !seen.contains(&std::mem::discriminant(&what))
@@ -447,13 +510,19 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         ConsoleOnly::Clwb => {
             // nothing to write back on the PC: patched to NOPs, no exception next time
             use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
-            let mut old = 0u32;
-            let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
-            // SAFETY: the instruction's own bytes, made writable for the patch and restored.
-            unsafe {
-                if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
-                    std::slice::from_raw_parts_mut(rip as *mut u8, len).fill(0x90);
-                    VirtualProtect(rip as *const _, len, old, &mut old);
+            let nops = [0x90u8; 16];
+            // In one store where it can be (a thread running it meanwhile sees it whole).
+            // SAFETY: the instruction's own bytes, which faulted just now.
+            if len > 16 || !unsafe { patch_bytes(rip, &code[..len], &nops[..len]) } {
+                let mut old = 0u32;
+                let mut places = patching();
+                // SAFETY: the instruction's own bytes, made writable for the patch and restored.
+                unsafe {
+                    if still(rip, &code[..len]) && VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+                        std::slice::from_raw_parts_mut(rip as *mut u8, len).fill(0x90);
+                        VirtualProtect(rip as *const _, len, old, &mut old);
+                        changed(&mut places, rip, &nops[..len.min(16)]);
+                    }
                 }
             }
         }
@@ -755,6 +824,37 @@ mod tests {
             std::ptr::copy_nonoverlapping(insn.as_ptr(), (page + 0x5c) as *mut u8, 6);
             assert!(!patch_sse4a(page + 0x5c, &insn, what, len));
             assert_eq!(*((page + 0x5c) as *const u8), 0xf2);
+            VirtualFree(page as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// Two threads meet an `insertq` at the same moment: the first replaces it, and the second
+    /// finds a jump where its instruction faulted. Its patch, from the bytes it read before,
+    /// leaves the first jump alone, and its handler runs the place again, through that jump.
+    /// Bytes that never were ours stay the crash they are.
+    #[test]
+    fn a_place_another_thread_replaced_runs_again() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree};
+        // SAFETY: memory of our own, written and read inside it.
+        unsafe {
+            let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+            assert_ne!(page, 0);
+            let at = page + 0x81;
+            let insn = [0xf2, 0x0f, 0x78, 0xc1, 0x10, 0x10];
+            std::ptr::copy_nonoverlapping(insn.as_ptr(), at as *mut u8, 6);
+            let (what, len) = decode::decode(&insn).unwrap();
+            assert!(patch_sse4a(at, &insn, what, len));
+            let first: [u8; 5] = std::ptr::read_unaligned(at as *const _);
+            assert_eq!(first[0], 0xe9);
+            assert!(!patch_sse4a(at, &insn, what, len), "the second thread's patch");
+            assert_eq!(std::ptr::read_unaligned::<[u8; 5]>(at as *const _), first, "the first jump stays");
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rip = at as u64;
+            assert_eq!(emulate(&mut context), CONTINUE_EXECUTION);
+            assert_eq!(context.Rip, at as u64, "run again, through the jump");
+            std::ptr::write_bytes((page + 0x200) as *mut u8, 0xcc, 16);
+            context.Rip = (page + 0x200) as u64;
+            assert_eq!(emulate(&mut context), 0, "never ours");
             VirtualFree(page as *mut _, 0, MEM_RELEASE);
         }
     }
