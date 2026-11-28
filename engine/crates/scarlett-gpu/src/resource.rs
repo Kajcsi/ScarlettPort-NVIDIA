@@ -5315,10 +5315,10 @@ float4 lit() : SV_Target { return 1.0; }
             if state != tested {
                 l.ResourceBarrier(&[moved(host_depth, state, tested)]);
             }
-            l.ClearRenderTargetView(colour, &[0.0; 4], None);
+            l.ClearRenderTargetView(colour.handle, &[0.0; 4], None);
             l.SetGraphicsRootSignature(&signature);
             l.SetPipelineState(&pipeline);
-            l.OMSetRenderTargets(1, Some(&colour), false, Some(&depth_view));
+            l.OMSetRenderTargets(1, Some(&colour.handle), false, Some(&depth_view.handle));
             l.RSSetViewports(&[D3D12_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
