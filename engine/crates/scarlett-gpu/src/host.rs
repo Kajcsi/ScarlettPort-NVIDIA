@@ -10620,6 +10620,8 @@ impl Host {
                     size: [width, height],
                 },
             );
+            // A cap on the frames shown a second (`SCARLETT_SHOWN_CAP`, off unless set).
+            crate::pace::before_present(crate::streamline::shown_per_frame());
             let called = crate::streamline::present_called(&presenting);
             let mut shown = p.swap_chain.Present(0, if p.presents_tearing { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) });
             if shown.is_err() && p.presents_tearing {
