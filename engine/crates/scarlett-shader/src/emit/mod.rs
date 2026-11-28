@@ -665,6 +665,45 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    let first = emit_forms(c, native, p, st, io, res);
+    // Refused where a branch on a mask operation's SCC needs the whole console wave's answer
+    // and not every lane runs: once more with each host wave's own answer, as such branches
+    // were taken before (`lower::with_scc_per_host_wave`, approximate). Every program the
+    // wave-wide form takes keeps it.
+    match &first {
+        Err(ShaderError::Unsupported { what, .. })
+            if lower::needs_every_lane(what) && lower::has_wave_scc_branch(p, st) =>
+        {
+            let again = lower::with_scc_per_host_wave(|| emit_forms(c, native, p, st, io, res));
+            if again.is_ok() {
+                SCC_PER_HOST_WAVE_PROGRAMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                again
+            } else {
+                first
+            }
+        }
+        _ => first,
+    }
+}
+
+/// Programs [`emit`] translated with mask-SCC branches per host wave (its last resort).
+static SCC_PER_HOST_WAVE_PROGRAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many programs were translated with their mask-SCC branches taken by each host wave
+/// on its own (approximate), the wave-wide form having refused them.
+pub fn scc_per_host_wave_programs() -> u64 {
+    SCC_PER_HOST_WAVE_PROGRAMS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// [`emit`] before its last resort.
+fn emit_forms(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     lower::take_lds_region();
