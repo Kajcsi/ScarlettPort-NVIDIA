@@ -4226,7 +4226,7 @@ mod tests {
             S_OK
         );
         resource(view).host.placed.store(true, Relaxed);
-        assert_eq!(alias_of(view), Some(source));
+        assert_eq!(alias_of(view).as_ref().map(|h| h.0), Some(source));
         let written = host_resource(source).unwrap();
         let sampled = host_resource(view).unwrap();
         let (upload, data) = host.upload_buffer(1024).unwrap();
@@ -4312,7 +4312,6 @@ mod tests {
             eprintln!("skipped: no fully typed format casting");
             return;
         }
-        eprintln!("D3D12 adapter vendor: {:x?}", host.adapter_vendor_id());
         const SOURCE: &str = r#"
 #define RS "DescriptorTable(SRV(t0, numDescriptors=3)), UAV(u0)"
 Texture2D<float4> as_srgb : register(t0);

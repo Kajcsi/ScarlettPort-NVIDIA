@@ -1209,13 +1209,13 @@ mod tests {
         f.put(Plain::TOPOLOGY as u64, &[4]);
         f.put(EXTERNAL, &[Box::into_raw(Box::new(make())) as u64]);
         let s = std::mem::take(&mut f.words);
-        let (calls, closed) = translate(std::ptr::null(), &s, || true);
+        let (calls, closed) = super::translate(std::ptr::null(), &s, || true);
         assert_eq!((calls, closed), (3, false));
         assert_eq!((ran.load(Relaxed), dropped.load(Relaxed)), (0, 2));
         // Not let go of, but without a host list behind it: dropped unrun.
         f.put(EXTERNAL, &[Box::into_raw(Box::new(make())) as u64]);
         let s = std::mem::take(&mut f.words);
-        assert_eq!(translate(std::ptr::null(), &s, || false), (1, false));
+        assert_eq!(super::translate(std::ptr::null(), &s, || false), (1, false));
         assert_eq!((ran.load(Relaxed), dropped.load(Relaxed)), (0, 3));
         f.recording = None;
     }
