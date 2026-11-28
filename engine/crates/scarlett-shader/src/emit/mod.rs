@@ -91,6 +91,8 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lds_setup;
+#[cfg(all(test, windows))]
+mod lds_setup_tests;
 mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
@@ -666,7 +668,7 @@ pub fn emit(
         if PAIRED_FIRST.get() {
             let again = emit_paired(c, native, p, st);
             lower::take_needs();
-            lower::take_meets();
+            lower::take_lds_region();
             report("paired, named", &again);
             if done(&again) {
                 return again.map(|(shader, _)| shader);
