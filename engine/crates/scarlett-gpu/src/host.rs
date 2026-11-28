@@ -142,14 +142,39 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// be let go, in milliseconds, and how many bytes of them go at most (the
 /// longest idle first): none but those of ten minutes while what is in use
 /// of the card (`used`: without what our own blocks have free, with what is
-/// kept free for others) is under 88 % of its budget, else enough to come
-/// down to 85 %. `SCARLETT_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
+/// kept free for others) is under 75 % of its budget, else enough to come
+/// down to 70 % (the two shares: `SCARLETT_TEXTURE_KEEP_PERCENT`).
+/// `SCARLETT_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
 /// all that are idle; `=1`: that rule with its two longer times.
 ///
 /// (By those times everything idle for 2.5 s went from 75 % of the budget
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
+    // After voidopcode/vilocity bc5fecf2 (GPL-3.0-or-later):
+    // `SCARLETT_TEXTURE_KEEP_PERCENT=<from>,<down to>` (75,70 unless set; it
+    // was 88,85). At 88 the card ran 2 % under the line at which no new
+    // texture is made (90, `resource::room`), and a scene that loads several
+    // GB of textures in half a minute crossed it: textures then waited (faces
+    // and skin without theirs) while copies whose title memory was long
+    // unmapped stayed. Measured there: with 88,85 the card had no room 321 s
+    // into the opening; with 75,70 never, at the same uploads and frame rate.
+    static PERCENTS: OnceLock<[u64; 2]> = OnceLock::new();
+    let [from, to] = *PERCENTS.get_or_init(|| keep_percents(&std::env::var("SCARLETT_TEXTURE_KEEP_PERCENT").unwrap_or_default()));
+    vram_keep_at(budget, used, from, to)
+}
+
+/// `"88,85"` as the two shares of [`vram_keep`]: between 30 and 95, the second
+/// no more than the first; anything else is 75 and 70.
+fn keep_percents(set: &str) -> [u64; 2] {
+    let mut parts = set.split(',').map(|p| p.trim().parse::<u64>().ok().filter(|v| (30..=95).contains(v)));
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(from), Some(to)) if to <= from => [from, to],
+        _ => [75, 70],
+    }
+}
+
+fn vram_keep_at(budget: u64, used: u64, from: u64, to: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 1_500;
@@ -157,12 +182,12 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    if used < share(from) {
         (KEPT_MS, u64::MAX)
     } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+        (IDLE_MS, used - share(to))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS, used - share(to))
     }
 }
 
@@ -12265,14 +12290,22 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn textures_are_kept_while_the_card_has_room() {
-        use super::vram_keep;
+        use super::{keep_percents, vram_keep_at};
         let gib = 1 << 30;
+        let vram_keep = |budget, used| vram_keep_at(budget, used, 88, 85);
         assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
         // Past it: the longest idle ones, enough to come down to 85 %.
         let (ms, bytes) = vram_keep(100 * gib, 90 * gib);
         assert_eq!((ms, bytes), (5_000, 5 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
+        // The default shares: from 75 % down to 70 %.
+        assert_eq!(keep_percents(""), [75, 70]);
+        assert_eq!(keep_percents("88,85"), [88, 85]);
+        assert_eq!(keep_percents("70,75"), [75, 70]);
+        assert_eq!(keep_percents("99,10"), [75, 70]);
+        assert_eq!(vram_keep_at(100 * gib, 74 * gib, 75, 70).0, 600_000);
+        assert_eq!(vram_keep_at(100 * gib, 80 * gib, 75, 70), (5_000, 10 * gib));
     }
 
     #[test]
