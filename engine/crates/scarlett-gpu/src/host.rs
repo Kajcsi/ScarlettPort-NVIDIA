@@ -11924,7 +11924,7 @@ fn compare_join() -> bool {
 
 /// The first hardware adapter by high-performance preference, with its name;
 /// `None` when DXGI cannot rank adapters, which keeps the default adapter.
-fn high_performance_adapter() -> Option<(windows::Win32::Graphics::Dxgi::IDXGIAdapter1, String)> {
+pub(crate) fn high_performance_adapter() -> Option<(windows::Win32::Graphics::Dxgi::IDXGIAdapter1, String)> {
     use windows::Win32::Graphics::Dxgi::*;
     // SAFETY: plain DXGI factory and adapter queries.
     unsafe {

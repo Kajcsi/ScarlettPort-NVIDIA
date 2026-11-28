@@ -467,13 +467,20 @@ fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain([0]).collect()
 }
 
-/// The adapter a device made with no adapter named is on (the first), its
-/// name and LUID.
+/// The adapter the host device is made on: the first hardware adapter by
+/// high-performance preference (`host::high_performance_adapter`, the dGPU
+/// of an Optimus laptop), else the first one, as a device made with no
+/// adapter named; its name and LUID.
 fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
     // SAFETY: plain DXGI queries.
     unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-        let adapter = factory.EnumAdapters1(0).ok()?;
+        let adapter = match crate::host::high_performance_adapter() {
+            Some((a, _)) => a,
+            None => {
+                let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+                factory.EnumAdapters1(0).ok()?
+            }
+        };
         let desc = adapter.GetDesc1().ok()?;
         let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
         Some((String::from_utf16_lossy(&desc.Description[..len]), desc.AdapterLuid))
